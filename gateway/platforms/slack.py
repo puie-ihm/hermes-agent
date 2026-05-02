@@ -2146,6 +2146,9 @@ class SlackAdapter(BasePlatformAdapter):
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
         metadata: Optional[Dict[str, Any]] = None,
+        origin_user: str = "",
+        origin_channel: str = "",
+        origin_thread: str = "",
     ) -> SendResult:
         """Send a Block Kit approval prompt with interactive buttons.
 
@@ -2159,6 +2162,16 @@ class SlackAdapter(BasePlatformAdapter):
             cmd_preview = command[:2900] + "..." if len(command) > 2900 else command
             thread_ts = self._resolve_thread_ts(None, metadata)
 
+            # Build source context footer for centralized approval channel
+            context_parts = []
+            if origin_user:
+                context_parts.append(f"Requested by: {origin_user}")
+            if origin_channel:
+                context_parts.append(f"Channel: <#{origin_channel}>")
+            if origin_thread:
+                context_parts.append(f"Thread: {origin_thread}")
+            context_footer = ("\n" + " | ".join(context_parts)) if context_parts else ""
+
             blocks = [
                 {
                     "type": "section",
@@ -2168,6 +2181,7 @@ class SlackAdapter(BasePlatformAdapter):
                             f":warning: *Command Approval Required*\n"
                             f"```{cmd_preview}```\n"
                             f"Reason: {description}"
+                            f"{context_footer}"
                         ),
                     },
                 },

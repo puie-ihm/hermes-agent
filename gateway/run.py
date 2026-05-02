@@ -12507,9 +12507,12 @@ class GatewayRunner:
 
                         _approval_channel = get_approval_channel()
                         if _approval_channel:
-                            # Centralized approval channel — post there with origin context
+                            # Centralized approval channel — post there with origin context.
+                            # Use _status_chat_id (captured before any routing) as the
+                            # origin, not source.chat_id which is already the approval
+                            # channel when routing is active.
                             _origin_user = source.user_id or ""
-                            _origin_channel = source.chat_id or ""
+                            _origin_channel = _status_chat_id or ""
                             _origin_thread = (
                                 _status_thread_metadata.get("thread_id")
                                 if _status_thread_metadata else ""

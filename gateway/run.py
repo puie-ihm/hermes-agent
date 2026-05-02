@@ -12503,13 +12503,35 @@ class GatewayRunner:
                 # false positives from MagicMock auto-attribute creation in tests.
                 if getattr(type(_status_adapter), "send_exec_approval", None) is not None:
                     try:
+                        from tools.approval import get_approval_channel
+
+                        _approval_channel = get_approval_channel()
+                        if _approval_channel:
+                            # Centralized approval channel — post there with origin context
+                            _origin_user = source.user_id or ""
+                            _origin_channel = source.chat_id or ""
+                            _origin_thread = (
+                                _status_thread_metadata.get("thread_id")
+                                if _status_thread_metadata else ""
+                            )
+                            _approval_chat_id = _approval_channel
+                        else:
+                            # Legacy per-user routing
+                            _origin_user = ""
+                            _origin_channel = ""
+                            _origin_thread = ""
+                            _approval_chat_id = _status_chat_id
+
                         _approval_result = asyncio.run_coroutine_threadsafe(
                             _status_adapter.send_exec_approval(
-                                chat_id=_status_chat_id,
+                                chat_id=_approval_chat_id,
                                 command=cmd,
                                 session_key=_approval_session_key,
                                 description=desc,
                                 metadata=_status_thread_metadata,
+                                origin_user=_origin_user,
+                                origin_channel=_origin_channel,
+                                origin_thread=_origin_thread,
                             ),
                             _loop_for_step,
                         ).result(timeout=15)

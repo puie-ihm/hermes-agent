@@ -1103,6 +1103,11 @@ DEFAULT_CONFIG = {
         # "Always Approve" to silence the prompt permanently; that flips
         # this key to false.
         "mcp_reload_confirm": True,
+        # Slack channel ID where all approval prompts are posted when
+        # approvals.approval_channel is configured.  When set, approval
+        # messages are sent to this channel instead of the user's session
+        # channel.  Empty string (default) = per-user routing (legacy).
+        "approval_channel": "",
         # List of user IDs who can approve/deny dangerous-command prompts in
         # gateway sessions. Empty list (default) means any authorized user can
         # approve. CLI approvals are always unrestricted (local terminal only).

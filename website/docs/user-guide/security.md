@@ -260,6 +260,26 @@ Your user ID is not in the `approvals.allowed_approvers` list.
 - User IDs are **platform-specific**: Slack IDs for Slack, Telegram IDs for Telegram, etc.
 - Non-approved users can still chat normally — they just can't act on approval prompts
 
+### Centralized Approval Channel
+
+Instead of posting approval prompts to the user's session channel, you can route all approval messages to a single designated channel (e.g. a `#security-ops` channel). This gives your team a single place to monitor and respond to all approval requests.
+
+```yaml
+approvals:
+  mode: manual
+  allowed_approvers:
+    - U028TNBPA22   # Puie
+  approval_channel: C0AR4A8S6DP   # #security-ops
+```
+
+When `approval_channel` is set:
+- All approval prompts are posted to that channel, regardless of where the user is chatting
+- The message includes context: which user triggered it, from which channel/thread
+- Any approver in `allowed_approvers` can respond via buttons or `/approve` in that channel
+- If `approval_channel` is empty (default), approvals go to the user's session channel (existing behavior)
+
+> **Note:** `approval_channel` is currently only supported for Slack. Other platforms fall back to per-user routing.
+
 ### DM Pairing System
 
 For more flexible authorization, Hermes includes a code-based pairing system. Instead of requiring user IDs upfront, unknown users receive a one-time pairing code that the bot owner approves via the CLI.

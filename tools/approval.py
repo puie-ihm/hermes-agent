@@ -378,6 +378,8 @@ class _ApprovalEntry:
 
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
+_pending_origin: dict[str, dict] = {}         # session_key → {origin_user, origin_channel, origin_thread, platform_adapter}
+_pending_origin_count: dict[str, int] = {}    # session_key → number of pending approvals
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
 
 
@@ -402,8 +404,39 @@ def unregister_gateway_notify(session_key: str) -> None:
     with _lock:
         _gateway_notify_cbs.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
+        _pending_origin.pop(session_key, None)
+        _pending_origin_count.pop(session_key, None)
     for entry in entries:
         entry.event.set()
+
+
+def set_approval_origin(session_key: str, origin_user: str,
+                        origin_channel: str, origin_thread: str,
+                        platform_adapter) -> None:
+    """Store origin context so approve/deny handlers can post back to the
+    originating thread/channel. Increments a ref-count so multiple concurrent
+    approvals in the same session are all accounted for."""
+    with _lock:
+        _pending_origin[session_key] = {
+            "origin_user": origin_user,
+            "origin_channel": origin_channel,
+            "origin_thread": origin_thread,
+            "platform_adapter": platform_adapter,
+        }
+        _pending_origin_count[session_key] = _pending_origin_count.get(session_key, 0) + 1
+
+
+def get_approval_origin(session_key: str) -> dict:
+    """Retrieve stored origin context for a session."""
+    with _lock:
+        return _pending_origin.get(session_key, {})
+
+
+def clear_approval_origin(session_key: str) -> None:
+    """Remove stored origin context for a session."""
+    with _lock:
+        _pending_origin.pop(session_key, None)
+        _pending_origin_count.pop(session_key, None)
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
@@ -433,6 +466,94 @@ def resolve_gateway_approval(session_key: str, choice: str,
         entry.result = choice
         entry.event.set()
     return len(targets)
+
+
+async def notify_approval_result(session_key: str, choice: str,
+                                  approver_name: str = "approver",
+                                  _origin_data: dict = None) -> None:
+    """After an approval decision, send a result message back to the
+    originating thread so the original user knows what happened.
+
+    Args:
+        session_key: The session key for the approval.
+        choice: The approval choice (once, session, always, deny).
+        approver_name: Display name of the approver.
+        _origin_data: Pre-extracted origin data. If None, retrieves from
+            _pending_origin (for callers that need the async function signature).
+    """
+    # Use pre-extracted origin if provided (from sync wrapper); otherwise fetch
+    origin = _origin_data
+    if origin is None:
+        with _lock:
+            origin = _pending_origin.get(session_key)
+
+    if not origin:
+        return
+
+    platform_adapter = origin.get("platform_adapter")
+    if not platform_adapter:
+        return
+
+    origin_channel = origin.get("origin_channel", "")
+    origin_thread = origin.get("origin_thread", "")
+
+    choice_labels = {
+        "once": "✅ Command approved (once)",
+        "session": "✅ Command approved for this session",
+        "always": "✅ Command approved permanently",
+        "deny": "❌ Command denied",
+    }
+    label = choice_labels.get(choice, f"Resolved: {choice}")
+    msg = f"{label} — by {approver_name}"
+
+    metadata = {"thread_id": origin_thread} if origin_thread else None
+
+    try:
+        await platform_adapter.send(
+            origin_channel,
+            msg,
+            metadata=metadata,
+        )
+    except Exception:
+        pass  # Non-critical — user already has the result in the approval channel
+
+
+def notify_approval_result_sync(session_key: str, choice: str,
+                                 approver_name: str = "approver",
+                                 loop=None) -> None:
+    """Synchronous wrapper for notify_approval_result.
+
+    Used by button click handlers that can't await directly.
+    Schedules the async notification on the gateway's event loop.
+    Decrements the origin ref-count; only clears when all pending approvals
+    for the session have been resolved.
+    """
+    # Extract and snapshot the origin data before decrementing the ref-count
+    with _lock:
+        count = _pending_origin_count.get(session_key, 1) - 1
+        if count > 0:
+            _pending_origin_count[session_key] = count
+            # Don't clear origin yet — more pending approvals remain
+            return
+        # Last approval resolved — safe to extract and clear
+        origin_data = _pending_origin.pop(session_key, None)
+        _pending_origin_count.pop(session_key, None)
+
+    if not origin_data:
+        return
+
+    try:
+        _loop = loop or asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    async def _do_notify():
+        await notify_approval_result(session_key, choice, approver_name, _origin_data=origin_data)
+
+    try:
+        _loop.call_soon(lambda: asyncio.create_task(_do_notify()))
+    except Exception:
+        pass  # Non-critical
 
 
 def has_blocking_approval(session_key: str) -> bool:

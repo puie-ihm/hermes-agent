@@ -9845,6 +9845,14 @@ class GatewayRunner:
         if _adapter:
             _adapter.resume_typing_for_chat(source.chat_id)
 
+        # Notify the origin thread/channel of the approval result
+        _approver_name = source.user_name or source.user_id or "approver"
+        try:
+            from tools.approval import notify_approval_result_sync
+            notify_approval_result_sync(session_key, choice, _approver_name)
+        except Exception:
+            pass
+
         count_msg = f" ({count} commands)" if count > 1 else ""
         logger.info("User approved %d dangerous command(s) via /approve%s", count, scope_msg)
         return f"✅ Command{'s' if count > 1 else ''} approved{scope_msg}{count_msg}. The agent is resuming..."
@@ -9892,6 +9900,14 @@ class GatewayRunner:
         _adapter = self.adapters.get(source.platform)
         if _adapter:
             _adapter.resume_typing_for_chat(source.chat_id)
+
+        # Notify the origin thread/channel of the denial
+        _denier_name = source.user_name or source.user_id or "approver"
+        try:
+            from tools.approval import notify_approval_result_sync
+            notify_approval_result_sync(session_key, "deny", _denier_name)
+        except Exception:
+            pass
 
         count_msg = f" ({count} commands)" if count > 1 else ""
         logger.info("User denied %d dangerous command(s) via /deny", count)
@@ -12503,7 +12519,7 @@ class GatewayRunner:
                 # false positives from MagicMock auto-attribute creation in tests.
                 if getattr(type(_status_adapter), "send_exec_approval", None) is not None:
                     try:
-                        from tools.approval import get_approval_channel
+                        from tools.approval import get_approval_channel, set_approval_origin
 
                         _approval_channel = get_approval_channel()
                         if _approval_channel:
@@ -12525,6 +12541,36 @@ class GatewayRunner:
                             _origin_thread = ""
                             _approval_chat_id = _status_chat_id
                             _approval_metadata = _status_thread_metadata
+
+                        # Store origin info so approve/deny handlers can post back
+                        set_approval_origin(
+                            _approval_session_key,
+                            _origin_user,
+                            _origin_channel,
+                            _origin_thread,
+                            _status_adapter,
+                        )
+
+                        # Notify user in origin thread that approval is being requested
+                        _origin_user_desc = f"<@{_origin_user}>" if _origin_user else "User"
+                        cmd_preview = cmd[:80] + "..." if len(cmd) > 80 else cmd
+                        _wait_msg = (
+                            f"⏳ Awaiting approval for command: `{cmd_preview[:200]}`\n"
+                            f"{_origin_user_desc} requested to run a command that requires approval.\n"
+                            f"You'll be notified when it's approved or denied."
+                        )
+                        _wait_metadata = {"thread_id": _origin_thread} if _origin_thread else None
+                        try:
+                            asyncio.run_coroutine_threadsafe(
+                                _status_adapter.send(
+                                    _origin_channel,
+                                    _wait_msg,
+                                    metadata=_wait_metadata,
+                                ),
+                                _loop_for_step,
+                            ).result(timeout=10)
+                        except Exception:
+                            pass  # Non-critical — the approval still goes through
 
                         _approval_result = asyncio.run_coroutine_threadsafe(
                             _status_adapter.send_exec_approval(

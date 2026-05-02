@@ -2162,14 +2162,21 @@ class SlackAdapter(BasePlatformAdapter):
             cmd_preview = command[:2900] + "..." if len(command) > 2900 else command
             thread_ts = self._resolve_thread_ts(None, metadata)
 
+            # Resolve origin_user ID to real display name for the approval message
+            origin_user_display = origin_user
+            if origin_user:
+                resolved = await self._resolve_user_name(origin_user, chat_id)
+                if resolved and resolved != origin_user:
+                    origin_user_display = resolved
+
             # Build source context footer for centralized approval channel
             context_parts = []
-            if origin_user:
-                context_parts.append(f"Requested by: {origin_user}")
+            if origin_user_display:
+                context_parts.append(f"Requested by: {origin_user_display}")
             if origin_channel:
                 context_parts.append(f"Channel: <#{origin_channel}>")
             if origin_thread:
-                context_parts.append(f"Thread: {origin_thread}")
+                context_parts.append(f"Thread: <{origin_thread}>")
             context_footer = ("\n" + " | ".join(context_parts)) if context_parts else ""
 
             blocks = [
@@ -2439,14 +2446,22 @@ class SlackAdapter(BasePlatformAdapter):
         if self._approval_resolved.pop(msg_ts, True):
             return
 
+        # Resolve user_id → real display name for the approval message
+        display_name = user_name
+        if user_id and user_id != user_name:
+            # Try to get a better display name via users_info
+            resolved = await self._resolve_user_name(user_id, channel_id)
+            if resolved and resolved != user_id:
+                display_name = resolved
+
         # Update the message to show the decision and remove buttons
         label_map = {
-            "once": f"✅ Approved once by {user_name}",
-            "session": f"✅ Approved for session by {user_name}",
-            "always": f"✅ Approved permanently by {user_name}",
-            "deny": f"❌ Denied by {user_name}",
+            "once": f"✅ Approved once by {display_name}",
+            "session": f"✅ Approved for session by {display_name}",
+            "always": f"✅ Approved permanently by {display_name}",
+            "deny": f"❌ Denied by {display_name}",
         }
-        decision_text = label_map.get(choice, f"Resolved by {user_name}")
+        decision_text = label_map.get(choice, f"Resolved by {display_name}")
 
         # Get original text from the section block
         original_text = ""
@@ -2487,10 +2502,17 @@ class SlackAdapter(BasePlatformAdapter):
             count = resolve_gateway_approval(session_key, choice)
             logger.info(
                 "Slack button resolved %d approval(s) for session %s (choice=%s, user=%s)",
-                count, session_key, choice, user_name,
+                count, session_key, choice, display_name,
             )
         except Exception as exc:
             logger.error("Failed to resolve gateway approval from Slack button: %s", exc)
+
+        # Notify the origin thread/channel of the approval result
+        try:
+            from tools.approval import notify_approval_result
+            await notify_approval_result(session_key, choice, display_name)
+        except Exception:
+            pass  # Non-critical
 
         # (approval state already consumed by atomic pop above)
 

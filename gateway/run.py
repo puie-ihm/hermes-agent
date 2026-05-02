@@ -12508,9 +12508,8 @@ class GatewayRunner:
                         _approval_channel = get_approval_channel()
                         if _approval_channel:
                             # Centralized approval channel — post there with origin context.
-                            # Use _status_chat_id (captured before any routing) as the
-                            # origin, not source.chat_id which is already the approval
-                            # channel when routing is active.
+                            # Pass metadata=None to ensure no thread_ts is applied
+                            # (we want a top-level message in the approval channel).
                             _origin_user = source.user_id or ""
                             _origin_channel = _status_chat_id or ""
                             _origin_thread = (
@@ -12518,12 +12517,14 @@ class GatewayRunner:
                                 if _status_thread_metadata else ""
                             )
                             _approval_chat_id = _approval_channel
+                            _approval_metadata = None  # top-level in approval channel
                         else:
                             # Legacy per-user routing
                             _origin_user = ""
                             _origin_channel = ""
                             _origin_thread = ""
                             _approval_chat_id = _status_chat_id
+                            _approval_metadata = _status_thread_metadata
 
                         _approval_result = asyncio.run_coroutine_threadsafe(
                             _status_adapter.send_exec_approval(
@@ -12531,7 +12532,7 @@ class GatewayRunner:
                                 command=cmd,
                                 session_key=_approval_session_key,
                                 description=desc,
-                                metadata=_status_thread_metadata,
+                                metadata=_approval_metadata,
                                 origin_user=_origin_user,
                                 origin_channel=_origin_channel,
                                 origin_thread=_origin_thread,

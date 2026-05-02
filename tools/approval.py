@@ -758,6 +758,18 @@ def is_approver_allowed(user_id: str) -> bool:
     return user_id in allowed
 
 
+def get_approval_channel() -> str:
+    """Read the approval_channel setting from config. Returns channel ID or empty string."""
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        approvals_cfg = config.get("approvals", {}) or {}
+        channel = approvals_cfg.get("approval_channel", "")
+        return str(channel).strip() if channel else ""
+    except Exception:
+        return ""
+
+
 def _smart_approve(command: str, description: str) -> str:
     """Use the auxiliary LLM to assess risk and decide approval.
 

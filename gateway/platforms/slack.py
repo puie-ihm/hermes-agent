@@ -2218,12 +2218,15 @@ class SlackAdapter(BasePlatformAdapter):
                 },
             ]
 
+            # Only thread when posting to the user's session channel.
+            # When routing to a centralized approval channel, post as a
+            # top-level message — the origin thread doesn't exist there.
             kwargs: Dict[str, Any] = {
                 "channel": chat_id,
                 "text": f"⚠️ Command approval required: {cmd_preview[:100]}",
                 "blocks": blocks,
             }
-            if thread_ts:
+            if thread_ts and not origin_channel:
                 kwargs["thread_ts"] = thread_ts
 
             result = await self._get_client(chat_id).chat_postMessage(**kwargs)

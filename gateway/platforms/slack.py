@@ -2298,16 +2298,16 @@ class SlackAdapter(BasePlatformAdapter):
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
 
-        # Authorization — reuse the exec-approval allowlist.
-        allowed_csv = os.getenv("SLACK_ALLOWED_USERS", "").strip()
-        if allowed_csv:
-            allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
-            if "*" not in allowed_ids and user_id not in allowed_ids:
-                logger.warning(
-                    "[Slack] Unauthorized slash-confirm click by %s (%s) — ignoring",
-                    user_name, user_id,
-                )
-                return
+        # Authorization — use the centralized approver allowlist from approval.py.
+        # This ensures button clicks and /approve slash commands share the same
+        # permissions config (approvals.allowed_approvers in config.yaml).
+        from tools.approval import is_approver_allowed
+        if not is_approver_allowed(user_id):
+            logger.warning(
+                "[Slack] Unauthorized slash-confirm click by %s (%s) — ignoring",
+                user_name, user_id,
+            )
+            return
 
         # Parse session_key|confirm_id back out
         if "|" not in value:
@@ -2398,16 +2398,16 @@ class SlackAdapter(BasePlatformAdapter):
 
         # Only authorized users may click approval buttons.  Button clicks
         # bypass the normal message auth flow in gateway/run.py, so we must
-        # check here as well.
-        allowed_csv = os.getenv("SLACK_ALLOWED_USERS", "").strip()
-        if allowed_csv:
-            allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
-            if "*" not in allowed_ids and user_id not in allowed_ids:
-                logger.warning(
-                    "[Slack] Unauthorized approval click by %s (%s) — ignoring",
-                    user_name, user_id,
-                )
-                return
+        # check here as well.  Use the centralized approver allowlist from
+        # approval.py so button clicks and /approve share the same permissions
+        # config (approvals.allowed_approvers in config.yaml).
+        from tools.approval import is_approver_allowed
+        if not is_approver_allowed(user_id):
+            logger.warning(
+                "[Slack] Unauthorized approval click by %s (%s) — ignoring",
+                user_name, user_id,
+            )
+            return
 
         # Map action_id to approval choice
         choice_map = {

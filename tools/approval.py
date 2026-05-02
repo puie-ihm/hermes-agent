@@ -727,6 +727,37 @@ def _get_cron_approval_mode() -> str:
         return "deny"
 
 
+def get_allowed_approvers() -> list:
+    """Read the allowed_approvers list from config. Returns list of user IDs."""
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        approvals_cfg = config.get("approvals", {}) or {}
+        approvers = approvals_cfg.get("allowed_approvers", [])
+        if not isinstance(approvers, list):
+            return []
+        return [str(a).strip() for a in approvers if a]
+    except Exception:
+        return []
+
+
+def is_approver_allowed(user_id: str) -> bool:
+    """Return True if the given user_id is allowed to approve/deny commands.
+
+    Returns True when allowed_approvers is empty (no restriction), or when
+    user_id is in the list. Returns True for CLI contexts (user_id is None
+    or empty) since CLI is inherently local/terminal.
+    """
+    if not user_id:
+        # CLI / local context — always allow
+        return True
+    allowed = get_allowed_approvers()
+    if not allowed:
+        # No restriction configured
+        return True
+    return user_id in allowed
+
+
 def _smart_approve(command: str, description: str) -> str:
     """Use the auxiliary LLM to assess risk and decide approval.
 

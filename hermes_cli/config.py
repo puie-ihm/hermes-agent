@@ -1103,6 +1103,10 @@ DEFAULT_CONFIG = {
         # "Always Approve" to silence the prompt permanently; that flips
         # this key to false.
         "mcp_reload_confirm": True,
+        # List of user IDs who can approve/deny dangerous-command prompts in
+        # gateway sessions. Empty list (default) means any authorized user can
+        # approve. CLI approvals are always unrestricted (local terminal only).
+        "allowed_approvers": [],
     },
 
     # Permanently allowed dangerous command patterns (added via "always" approval)

@@ -9801,8 +9801,19 @@ class GatewayRunner:
         session_key = self._session_key_for_source(source)
 
         from tools.approval import (
-            resolve_gateway_approval, has_blocking_approval,
+            resolve_gateway_approval, has_blocking_approval, is_approver_allowed,
         )
+
+        # Check if this user is allowed to approve
+        if not is_approver_allowed(source.user_id):
+            logger.warning(
+                "Approve denied: user_id=%s not in allowed_approvers",
+                source.user_id,
+            )
+            return (
+                "⛔ Only designated approvers can respond to approval prompts.\n"
+                "Your user ID is not in the `approvals.allowed_approvers` list."
+            )
 
         if not has_blocking_approval(session_key):
             if session_key in self._pending_approvals:
@@ -9850,8 +9861,19 @@ class GatewayRunner:
         session_key = self._session_key_for_source(source)
 
         from tools.approval import (
-            resolve_gateway_approval, has_blocking_approval,
+            resolve_gateway_approval, has_blocking_approval, is_approver_allowed,
         )
+
+        # Check if this user is allowed to deny
+        if not is_approver_allowed(source.user_id):
+            logger.warning(
+                "Deny denied: user_id=%s not in allowed_approvers",
+                source.user_id,
+            )
+            return (
+                "⛔ Only designated approvers can respond to approval prompts.\n"
+                "Your user ID is not in the `approvals.allowed_approvers` list."
+            )
 
         if not has_blocking_approval(session_key):
             if session_key in self._pending_approvals:

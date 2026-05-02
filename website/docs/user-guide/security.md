@@ -232,6 +232,34 @@ or configure platform allowlists (e.g., TELEGRAM_ALLOWED_USERS=your_id).
 ```
 :::
 
+### Approver Restriction
+
+By default, any authorized user can respond to dangerous-command approval prompts (`/approve`, `/deny`) in gateway sessions. To restrict this to a specific set of users, add their IDs to `approvals.allowed_approvers` in `~/.hermes/config.yaml`:
+
+```yaml
+approvals:
+  mode: manual
+  allowed_approvers:
+    - U028TNBPA22   # Puie
+    - U0296G7AH0U   # other admin
+```
+
+Only users whose ID appears in this list can approve or deny dangerous-command prompts. Anyone else receives:
+
+```
+⛔ Only designated approvers can respond to approval prompts.
+Your user ID is not in the `approvals.allowed_approvers` list.
+```
+
+| Setting | Behavior |
+|---------|----------|
+| `allowed_approvers: []` (empty/default) | Any authorized user can approve |
+| `allowed_approvers: [id1, id2] ` | Only listed user IDs can approve |
+
+- **CLI is unaffected** — local terminal approvals are always allowed
+- User IDs are **platform-specific**: Slack IDs for Slack, Telegram IDs for Telegram, etc.
+- Non-approved users can still chat normally — they just can't act on approval prompts
+
 ### DM Pairing System
 
 For more flexible authorization, Hermes includes a code-based pairing system. Instead of requiring user IDs upfront, unknown users receive a one-time pairing code that the bot owner approves via the CLI.

@@ -4904,6 +4904,43 @@ def resolve_provider_client(
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
 
+    # ── MiniMax OAuth ─────────────────────────────────────────────────
+    # Without this branch, minimax-oauth falls through to "unhandled
+    # auth_type oauth_minimax" and returns (None, None), silently
+    # breaking all auxiliary tasks configured with provider: minimax-oauth
+    # (compression, mcp, title_generation, relevance_filter, …) and
+    # forcing _resolve_auto() Step 1 to fail on every call, which triggers
+    # the noisy openrouter → nous fallback chain.
+    if provider == "minimax-oauth":
+        try:
+            from hermes_cli.auth import resolve_minimax_oauth_runtime_credentials
+            creds = resolve_minimax_oauth_runtime_credentials()
+        except Exception as exc:
+            logger.warning(
+                "resolve_provider_client: minimax-oauth credentials unavailable: %s", exc
+            )
+            return None, None
+        api_key = str(creds.get("api_key") or "").strip()
+        base_url = str(creds.get("base_url") or "").strip().rstrip("/")
+        if not api_key or not base_url:
+            logger.warning(
+                "resolve_provider_client: minimax-oauth credentials incomplete"
+            )
+            return None, None
+        default_model = _get_aux_model_for_provider("minimax-oauth")
+        final_model = _normalize_resolved_model(model or default_model, provider)
+        try:
+            from agent.anthropic_adapter import build_anthropic_client
+            real_client = build_anthropic_client(api_key, base_url)
+        except Exception as exc:
+            logger.warning(
+                "resolve_provider_client: failed to build minimax-oauth client: %s", exc
+            )
+            return None, None
+        client = AnthropicAuxiliaryClient(real_client, final_model, api_key, base_url, is_oauth=False)
+        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                else (client, final_model))
+
     # ── Custom endpoint (OPENAI_BASE_URL + OPENAI_API_KEY) ───────────
     if provider == "custom":
         custom_base = ""

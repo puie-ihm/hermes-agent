@@ -2866,7 +2866,7 @@ class BasePlatformAdapter(ABC):
     async def handle_message(self, event: MessageEvent) -> None:
         """
         Process an incoming message.
-        
+
         This method returns quickly by spawning background tasks.
         This allows new messages to be processed even while an agent is running,
         enabling interruption support.
@@ -2875,7 +2875,22 @@ class BasePlatformAdapter(ABC):
             return
 
         coerce_plaintext_gateway_command(event)
-        
+
+        # Cross-platform relevance gate. Drops messages that look like
+        # human-to-human chatter in shared rooms/threads. Disabled by
+        # default (see gateway.relevance_filter.RelevanceFilterConfig);
+        # always passes DMs, slash commands, replies, and internal events.
+        try:
+            from gateway.relevance_filter import should_respond as _should_respond
+            if not await _should_respond(event, bot_name=self.name):
+                return
+        except Exception as _rf_exc:
+            # Fail-open: a broken filter must never swallow real messages.
+            logger.debug(
+                "[%s] Relevance filter errored (%s); processing message",
+                self.name, _rf_exc,
+            )
+
         session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),

@@ -119,18 +119,23 @@ def test_slash_command_bypasses_classifier():
         assert asyncio.run(rf.should_respond(event, config=cfg)) is True
 
 
-def test_reply_to_text_bypasses_classifier():
-    """A reply explicitly threads off another message — treat as directed."""
+def test_reply_to_text_does_not_bypass_classifier():
+    """Thread replies must go through the LLM.
+
+    Slack sets ``reply_to_text`` for *every* message in a thread (the
+    thread parent), even when the user is addressing another human.  We
+    cannot treat its presence as "directed at the bot" — the classifier
+    has to decide.
+    """
     cfg = rf.RelevanceFilterConfig(enabled=True)
     event = _make_event(
-        text="cool, thanks",
+        text="Hey John, can you help check?",
         chat_type="channel",
-        reply_to_text="here's the deploy status: green",
+        reply_to_text="do you see what I write before?",
     )
-    with patch.object(rf, "_classify", new=AsyncMock(side_effect=AssertionError(
-        "Replies must never reach the classifier"
-    ))):
-        assert asyncio.run(rf.should_respond(event, config=cfg)) is True
+    with patch.object(rf, "_classify", new=AsyncMock(return_value=False)) as classify:
+        assert asyncio.run(rf.should_respond(event, config=cfg)) is False
+        classify.assert_awaited_once()
 
 
 def test_internal_event_bypasses_classifier():
@@ -360,6 +365,48 @@ def test_classify_treats_relevant_response_as_true():
             rf._classify(event, cfg, bot_name="hermes", platform_name="slack")
         )
     assert decision is True
+
+
+def test_classify_prompt_includes_reply_parent_when_present():
+    """The thread parent must reach the LLM so it can distinguish
+    bot-thread continuation from human-to-human chatter."""
+    cfg = rf.RelevanceFilterConfig(enabled=True)
+    event = _make_event(
+        text="Hey John, can you help check?",
+        chat_type="channel",
+        reply_to_text="do you see what I write before?",
+    )
+    client = _FakeAsyncClient("IGNORE")
+
+    with patch(
+        "agent.auxiliary_client.get_async_text_auxiliary_client",
+        return_value=(client, "claude-haiku-4-5"),
+    ):
+        asyncio.run(
+            rf._classify(event, cfg, bot_name="hermes", platform_name="slack")
+        )
+
+    assert client._completions.calls, "aux client must be invoked"
+    user_prompt = client._completions.calls[0]["messages"][1]["content"]
+    assert "do you see what I write before?" in user_prompt
+    assert "Hey John, can you help check?" in user_prompt
+
+
+def test_classify_prompt_omits_reply_block_when_no_parent():
+    cfg = rf.RelevanceFilterConfig(enabled=True)
+    event = _make_event(text="what's the status?", reply_to_text=None)
+    client = _FakeAsyncClient("RELEVANT")
+
+    with patch(
+        "agent.auxiliary_client.get_async_text_auxiliary_client",
+        return_value=(client, "claude-haiku-4-5"),
+    ):
+        asyncio.run(
+            rf._classify(event, cfg, bot_name="hermes", platform_name="slack")
+        )
+
+    user_prompt = client._completions.calls[0]["messages"][1]["content"]
+    assert "parent of the thread" not in user_prompt
 
 
 def test_classify_no_aux_client_fails_open():

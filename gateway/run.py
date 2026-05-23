@@ -1429,6 +1429,14 @@ class GatewayRunner:
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
+        # Install the cross-platform relevance filter config so
+        # BasePlatformAdapter.handle_message() can gate incoming traffic.
+        try:
+            from gateway.relevance_filter import configure as _configure_relevance_filter
+            _configure_relevance_filter(self.config.relevance_filter)
+        except Exception as _rf_exc:
+            logger.debug("Relevance filter init skipped: %s", _rf_exc)
+
         # Load ephemeral config from config.yaml / env vars.
         # Both are injected at API-call time only and never persisted.
         self._prefill_messages = self._load_prefill_messages()

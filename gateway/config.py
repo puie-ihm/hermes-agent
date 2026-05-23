@@ -17,9 +17,15 @@ from typing import Dict, List, Optional, Any, Callable
 from enum import Enum
 
 from hermes_cli.config import get_hermes_home
+from gateway.relevance_filter import RelevanceFilterConfig
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
+
+
+def _make_default_relevance_filter_config() -> RelevanceFilterConfig:
+    """Default factory for ``GatewayConfig.relevance_filter`` (disabled)."""
+    return RelevanceFilterConfig()
 
 
 def _coerce_bool(value: Any, default: bool = True) -> bool:
@@ -486,6 +492,14 @@ class GatewayConfig:
     # Streaming configuration
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
 
+    # Cross-platform relevance filter (LLM-based gate that drops messages
+    # which look like human-to-human chatter in shared rooms/threads).
+    # Disabled by default; uses the auxiliary-LLM provider chain when
+    # enabled. See gateway/relevance_filter.py for details.
+    relevance_filter: "RelevanceFilterConfig" = field(
+        default_factory=lambda: _make_default_relevance_filter_config(),
+    )
+
     # Session store pruning: drop SessionEntry records older than this many
     # days from the in-memory dict and sessions.json.  Keeps the store from
     # growing unbounded in gateways serving many chats/threads/users over
@@ -585,6 +599,7 @@ class GatewayConfig:
             "thread_sessions_per_user": self.thread_sessions_per_user,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
             "streaming": self.streaming.to_dict(),
+            "relevance_filter": self.relevance_filter.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
         }
     
@@ -653,6 +668,9 @@ class GatewayConfig:
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
+            relevance_filter=RelevanceFilterConfig.from_dict(
+                data.get("relevance_filter", {})
+            ),
             session_store_max_age_days=session_store_max_age_days,
         )
 
@@ -1221,7 +1239,13 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
 
 def _apply_env_overrides(config: GatewayConfig) -> None:
     """Apply environment variable overrides to config."""
-    
+
+    # Cross-platform relevance filter (HERMES_RELEVANCE_FILTER_*).
+    # Env vars override config.yaml; see gateway/relevance_filter.py.
+    config.relevance_filter = RelevanceFilterConfig.from_env(
+        base=config.relevance_filter
+    )
+
     # Telegram
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
     if telegram_token:

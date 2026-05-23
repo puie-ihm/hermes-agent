@@ -1084,8 +1084,20 @@ class SlackAdapter(BasePlatformAdapter):
                 self._warn_if_inchannel_without_flat_reply(team_name)
 
             # Register message event handler
+            #
+            # Socket Mode envelope ack: slack-bolt only sends the WebSocket
+            # envelope ack to Slack when the listener calls ``await ack()``.
+            # If ack is not called within ``ack_timeout`` (default 3s), bolt
+            # logs ``warning_did_not_call_ack`` and the envelope stays unacked
+            # — Slack then re-delivers the same event after its retry timeout
+            # (~30s) or on the next Socket Mode reconnect. We've seen the same
+            # ``msg=`` ts re-enter the pipeline ~6 minutes later because of
+            # this, which the 5-min ``MessageDeduplicator`` TTL just misses.
+            # Ack BEFORE doing the slow work (relevance filter + agent turn)
+            # so the envelope is settled immediately.
             @self._app.event("message")
-            async def handle_message_event(event, say):
+            async def handle_message_event(event, say, ack):
+                await ack()
                 await self._handle_slack_message(event)
 
             # Handle app_mention explicitly. In some Slack app configurations,
@@ -1096,23 +1108,25 @@ class SlackAdapter(BasePlatformAdapter):
             # @mention, they share the same event ts — the dedup in
             # _handle_slack_message (MessageDeduplicator) suppresses the second.
             @self._app.event("app_mention")
-            async def handle_app_mention(event, say):
+            async def handle_app_mention(event, say, ack):
+                await ack()
                 await self._handle_slack_message(event)
 
             # File lifecycle events can arrive around snippet uploads even when
             # the actual user message is what we care about. Ack them so Slack
             # doesn't log noisy 404 "unhandled request" warnings.
             @self._app.event("file_shared")
-            async def handle_file_shared(event, say):
+            async def handle_file_shared(event, say, ack):
+                await ack()
                 await self._handle_slack_file_shared(event)
 
             @self._app.event("file_created")
-            async def handle_file_created(event, say):
-                pass
+            async def handle_file_created(event, say, ack):
+                await ack()
 
             @self._app.event("file_change")
-            async def handle_file_change(event, say):
-                pass
+            async def handle_file_change(event, say, ack):
+                await ack()
 
             # Reactions are useful lightweight acknowledgements in Slack, but
             # Hermes does not currently need to route them into the agent loop.
@@ -1127,11 +1141,13 @@ class SlackAdapter(BasePlatformAdapter):
                 pass
 
             @self._app.event("assistant_thread_started")
-            async def handle_assistant_thread_started(event, say):
+            async def handle_assistant_thread_started(event, say, ack):
+                await ack()
                 await self._handle_assistant_thread_lifecycle_event(event)
 
             @self._app.event("assistant_thread_context_changed")
-            async def handle_assistant_thread_context_changed(event, say):
+            async def handle_assistant_thread_context_changed(event, say, ack):
+                await ack()
                 await self._handle_assistant_thread_lifecycle_event(event)
 
             # Register slash command handler(s)
@@ -2592,6 +2608,26 @@ class SlackAdapter(BasePlatformAdapter):
         event_ts = event.get("ts", "")
         if event_ts and self._dedup.is_duplicate(event_ts):
             return
+
+        # Staleness guard: drop events whose Slack-side ts is older than 60s.
+        # Chat is real-time — by the time a redelivery arrives ~5–6 min later
+        # (Socket Mode reconnect replay), the user has moved on. Re-processing
+        # would duplicate side effects (tool calls, commits, PRs, outbound
+        # messages) which is more damaging than a missed message the user can
+        # just retype. Normal delivery latency is sub-second, so 60s is a
+        # generous floor that only trips on retries.
+        if event_ts:
+            try:
+                msg_age = time.time() - float(event_ts)
+                if msg_age > 60:
+                    logger.info(
+                        "[Slack] dropping stale event ts=%s age=%.0fs",
+                        event_ts,
+                        msg_age,
+                    )
+                    return
+            except (ValueError, TypeError):
+                pass
 
         # Bot message filtering (SLACK_ALLOW_BOTS / config allow_bots):
         #   "none"     — ignore all bot messages (default, backward-compatible)

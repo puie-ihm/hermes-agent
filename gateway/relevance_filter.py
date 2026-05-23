@@ -191,6 +191,7 @@ CLASSIFIER_USER_TEMPLATE = (
     "---\n"
     "{context}\n"
     "---\n"
+    "{reply_block}"
     "Latest message (from {sender}):\n"
     "{message}\n\n"
     "Should the assistant respond? Answer with one word: RELEVANT or IGNORE."
@@ -230,8 +231,14 @@ async def should_respond(
     if getattr(event, "internal", False):
         return True
 
-    if getattr(event, "reply_to_text", None):
-        return True
+    # NOTE: we deliberately do NOT bypass on ``reply_to_text`` here.
+    # In Slack (and other thread-aware adapters) every message inside a
+    # thread carries ``reply_to_text`` set to the thread parent — even
+    # when the user is addressing another human in the same thread.
+    # Letting the LLM classifier see the ``[Replying to: "..."]`` prefix
+    # that the runner injects into ``event.text`` gives it enough context
+    # to make the right call without us mistaking thread continuation
+    # for "directed at the bot".
 
     text = (getattr(event, "text", "") or "").strip()
     min_len = max(1, cfg.min_text_length)
@@ -365,11 +372,28 @@ async def _classify(
     if len(message_excerpt) > 1500:
         message_excerpt = message_excerpt[:1500] + "…"
 
+    # Slack / Telegram / Discord adapters set ``reply_to_text`` to the
+    # thread parent (or replied-to message) before gateway.run prepends a
+    # ``[Replying to: "..."]`` prefix to the user text.  At filter time
+    # that injection hasn't happened yet, so we surface the parent
+    # explicitly to the classifier — without it, "Hey John, can you help?"
+    # looks identical inside a bot thread and a human-to-human thread.
+    reply_excerpt = (getattr(event, "reply_to_text", "") or "").strip()
+    if len(reply_excerpt) > 600:
+        reply_excerpt = reply_excerpt[:600] + "…"
+    reply_block = (
+        f"This message is a reply to (parent of the thread):\n"
+        f"---\n{reply_excerpt}\n---\n"
+        if reply_excerpt
+        else ""
+    )
+
     system_prompt = CLASSIFIER_SYSTEM_PROMPT
     user_prompt = CLASSIFIER_USER_TEMPLATE.format(
         bot_name=bot_name or "the assistant",
         platform=platform_name or "?",
         context=context,
+        reply_block=reply_block,
         sender=sender,
         message=message_excerpt,
     )

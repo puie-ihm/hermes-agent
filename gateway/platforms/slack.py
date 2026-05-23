@@ -309,6 +309,12 @@ class SlackAdapter(BasePlatformAdapter):
         self._app: Optional[Any] = None
         self._handler: Optional[Any] = None
         self._bot_user_id: Optional[str] = None
+        # Bot's actual display handle resolved from auth.test (e.g.
+        # "ihm_agents"). Used by the cross-platform relevance filter to
+        # tell the LLM classifier what name to look for when deciding if
+        # a message is directed at the bot. Defaults to None until the
+        # first auth.test response in connect().
+        self._bot_display_name: Optional[str] = None
         self._user_name_cache: Dict[str, str] = {}  # user_id → display name
         self._socket_mode_task: Optional[asyncio.Task] = None
         # Multi-workspace support
@@ -503,6 +509,18 @@ class SlackAdapter(BasePlatformAdapter):
         # Non-fatal — the user saw the initial ack already.
         return SendResult(success=True, message_id=None)
 
+    @property
+    def bot_display_name(self) -> str:
+        """Slack handle resolved at ``auth.test`` (e.g. ``"ihm_agents"``).
+
+        Returns the bare username Slack reports as the bot's identity, so
+        the relevance-filter classifier knows what name to look for when
+        deciding whether a message is directed at the bot or at another
+        human in the same channel/thread.  Falls back to ``self.name``
+        (``"Slack"``) before the first auth response lands.
+        """
+        return self._bot_display_name or self.name
+
     async def connect(self) -> bool:
         """Connect to Slack via Socket Mode."""
         if not SLACK_AVAILABLE:
@@ -585,6 +603,8 @@ class SlackAdapter(BasePlatformAdapter):
                 # First token sets the primary bot_user_id (backward compat)
                 if self._bot_user_id is None:
                     self._bot_user_id = bot_user_id
+                if self._bot_display_name is None and bot_name and bot_name != "unknown":
+                    self._bot_display_name = bot_name
 
                 logger.info(
                     "[Slack] Authenticated as @%s in workspace %s (team: %s)",

@@ -1531,7 +1531,20 @@ class BasePlatformAdapter(ABC):
     def name(self) -> str:
         """Human-readable name for this adapter."""
         return self.platform.value.title()
-    
+
+    @property
+    def bot_display_name(self) -> str:
+        """Return the bot's display name/handle on this platform.
+
+        Falls back to ``self.name`` (e.g. ``"Slack"``) when the adapter
+        hasn't resolved a real bot identity yet.  Adapters that know
+        their bot's username (Slack ``auth.test``, Telegram ``getMe``,
+        Discord ``self.user.name``) should override this so the
+        relevance filter and other identity-aware consumers see the
+        actual handle (e.g. ``"ihm_agents"``).
+        """
+        return self.name
+
     @property
     def is_connected(self) -> bool:
         """Check if adapter is currently connected."""
@@ -2879,10 +2892,10 @@ class BasePlatformAdapter(ABC):
         # Cross-platform relevance gate. Drops messages that look like
         # human-to-human chatter in shared rooms/threads. Disabled by
         # default (see gateway.relevance_filter.RelevanceFilterConfig);
-        # always passes DMs, slash commands, replies, and internal events.
+        # always passes DMs, slash commands, and internal events.
         try:
             from gateway.relevance_filter import should_respond as _should_respond
-            if not await _should_respond(event, bot_name=self.name):
+            if not await _should_respond(event, bot_name=self.bot_display_name):
                 return
         except Exception as _rf_exc:
             # Fail-open: a broken filter must never swallow real messages.

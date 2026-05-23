@@ -437,3 +437,32 @@ def test_classify_unexpected_response_fails_open():
             rf._classify(event, cfg, bot_name="hermes", platform_name="slack")
         )
     assert decision is True
+
+
+def test_classify_bot_handle_appears_in_prompt():
+    """The classifier prompt must surface the bot's actual handle so it
+    can apply the 'addressed-to-other-human' rule."""
+    cfg = rf.RelevanceFilterConfig(enabled=True)
+    event = _make_event(text="hey John, where are you?")
+    client = _FakeAsyncClient("IGNORE")
+
+    with patch(
+        "agent.auxiliary_client.get_async_text_auxiliary_client",
+        return_value=(client, "claude-haiku-4-5"),
+    ):
+        asyncio.run(
+            rf._classify(event, cfg, bot_name="ihm_agents", platform_name="slack")
+        )
+
+    user_prompt = client._completions.calls[0]["messages"][1]["content"]
+    assert "`ihm_agents`" in user_prompt
+    assert "hey John, where are you?" in user_prompt
+
+
+def test_system_prompt_includes_explicit_non_direction_example():
+    """The few-shot block must document the 'I wasn't talking to you' case."""
+    assert "wasn't talking to you" in rf.CLASSIFIER_SYSTEM_PROMPT
+    # Default-IGNORE tie-breaker must be present so weaker classifiers
+    # don't fall back to RELEVANT on every ambiguous message.
+    assert "ambiguous" in rf.CLASSIFIER_SYSTEM_PROMPT
+    assert "IGNORE" in rf.CLASSIFIER_SYSTEM_PROMPT

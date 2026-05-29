@@ -11565,6 +11565,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "[[react:pray]]) to acknowledge with a single emoji and say nothing.\n"
                 "- Output exactly [[silent]] if this is a conversation between others "
                 "that does not need you.\n"
+                "If the message addresses someone else by name (even without an "
+                "@mention) or continues a side-conversation between other people, "
+                "choose [[silent]] or [[react:emoji]] unless you are clearly also "
+                "being asked.\n"
                 "Pick the lightest appropriate option; do not be chatty.]\n\n"
                 f"{message_text}"
             )

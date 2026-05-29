@@ -165,3 +165,32 @@ def test_plain_reply_has_no_sentinel():
     text = "Sure, the deploy finished at 10:00."
     assert "[[silent]]" not in text
     assert _REACT_RE.search(text) is None
+
+
+# ---- sentinel parsing is unconditional (regression: [[silent]] leak) -------
+# The send chokepoint in base.py must parse decision sentinels on EVERY Slack
+# turn, not only is_followup_decision turns — otherwise a model that emits
+# [[silent]] in a direct-mention turn leaks the raw token into the channel as
+# visible text (observed in prod 2026-05-29). This guards the gate condition.
+
+import inspect  # noqa: E402
+from gateway.platforms import base as _base_mod  # noqa: E402
+
+
+def _send_chokepoint_source() -> str:
+    src = inspect.getsource(_base_mod.BasePlatformAdapter)
+    i = src.index("[[silent]]")
+    # the `if response:` guard that opens the sentinel block sits just above
+    return src[max(0, i - 600):i]
+
+
+def test_sentinel_block_not_gated_on_followup_flag():
+    """The sentinel-parsing block must NOT be gated on is_followup_decision."""
+    head = _send_chokepoint_source()
+    # The guard immediately preceding the [[silent]] check is a bare
+    # `if response:` — not `if response and ... is_followup_decision`.
+    assert "is_followup_decision" not in head, (
+        "sentinel parsing is gated on is_followup_decision again — a [[silent]]/"
+        "[[react]] emitted outside triage will leak as visible text"
+    )
+    assert "if response:" in head

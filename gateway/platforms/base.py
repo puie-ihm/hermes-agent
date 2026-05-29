@@ -5076,12 +5076,15 @@ class BasePlatformAdapter(ABC):
                 response = None
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
-            if response and getattr(event, "is_followup_decision", False):
-                # Agent-decision sentinels (Slack thread_followup_mode=agent):
-                # [[silent]] suppresses the reply entirely; [[react:emoji]]
-                # suppresses the text and adds a single emoji reaction instead.
-                # Gated on is_followup_decision so a normal reply that happens
-                # to contain the marker text isn't accidentally dropped.
+            if response:
+                # Agent-decision sentinels (Slack thread_followup_mode=agent).
+                # These are RESERVED control tokens — the model may emit them in
+                # ANY turn, not only triage follow-ups (e.g. a direct @-mention it
+                # decides not to answer). Parse unconditionally so a raw token can
+                # never leak into the channel as visible text (the bug that made
+                # LaHermes post a literal "[[silent]]" message).
+                #   [[silent]]        → suppress the reply entirely
+                #   [[react:emoji]]   → suppress text, add one emoji reaction
                 _decider = getattr(self, "_apply_decision_reaction", None)
                 if "[[silent]]" in response:
                     logger.info("[%s] Agent chose [[silent]] — suppressing reply", self.name)

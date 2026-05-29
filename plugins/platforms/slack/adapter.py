@@ -3409,10 +3409,16 @@ class SlackAdapter(BasePlatformAdapter):
         #   4. There's an existing session for this thread (survives restarts)
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         routing_text = original_text or ""
+        # Parse ALL <@Uxxx> mentions so we can tell "the bot was addressed" from
+        # "another person was addressed". The latter must NOT make the bot answer
+        # on their behalf (prod bug 2026-05-29: "@Matteo are you available?" →
+        # LaHermes replied "Yes I'm available").
+        _mentioned_uids = set(re.findall(r"<@([A-Z0-9]+)>", routing_text))
         is_mentioned = bool(
-            (bot_uid and f"<@{bot_uid}>" in routing_text)
+            (bot_uid and bot_uid in _mentioned_uids)
             or self._slack_message_matches_mention_patterns(routing_text)
         )
+        _other_user_mentioned = bool(_mentioned_uids - ({bot_uid} if bot_uid else set()))
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
@@ -3426,34 +3432,56 @@ class SlackAdapter(BasePlatformAdapter):
                 )
                 return
 
+            _agent_mode = self._thread_followup_mode() == "agent"
+            _in_thread = self._in_bot_thread(
+                event_thread_ts, channel_id, user_id, is_thread_reply
+            )
+            # DEBUG: capture every routing input so a misroute (e.g. answering
+            # for an @-mentioned human) is provable from logs without a repro.
+            logger.debug(
+                "[Slack] routing chat=%s ts=%s bot=%s is_mentioned=%s "
+                "other_mentioned=%s mentioned_uids=%s thread_reply=%s "
+                "in_bot_thread=%s strict=%s followup_mode=%s",
+                channel_id, ts, bot_uid, is_mentioned, _other_user_mentioned,
+                sorted(_mentioned_uids), is_thread_reply, _in_thread,
+                self._slack_strict_mention(), self._thread_followup_mode(),
+            )
+
             if channel_id in self._slack_free_response_channels():
                 pass  # Free-response channel — always process
             elif not self._slack_require_mention():
                 pass  # Mention requirement disabled globally for Slack
-            elif self._slack_strict_mention() and not is_mentioned:
-                # thread_followup_mode=agent: instead of dropping non-mention
-                # follow-ups, let them reach the agent IF this is a thread the
-                # bot participates in, so the agent can decide reply/react/silent.
-                if self._thread_followup_mode() == "agent" and self._in_bot_thread(
-                    event_thread_ts, channel_id, user_id, is_thread_reply
-                ):
-                    # Circuit-breaker: cap consecutive bot-originated follow-up
-                    # turns per thread to stop runaway agent-to-agent ack loops.
-                    _is_bot_msg = bool(event.get("bot_id") or event.get("subtype") == "bot_message")
-                    _cb = getattr(self, "_followup_bot_turns", None)
-                    if _cb is None:
-                        _cb = self._followup_bot_turns = {}
-                    if _is_bot_msg:
-                        _cb[event_thread_ts] = _cb.get(event_thread_ts, 0) + 1
-                        if _cb[event_thread_ts] > 3:
-                            logger.info("[Slack] follow-up circuit-breaker tripped for thread %s", event_thread_ts)
-                            return
-                    else:
-                        _cb.pop(event_thread_ts, None)  # human turn resets the counter
-                    _followup_decision = True
+            elif is_mentioned:
+                pass  # Bot was @-mentioned (even alongside others) → reply
+            elif _agent_mode and _in_thread:
+                # Not mentioned, but in a thread the bot participates in. Let the
+                # agent triage (reply / [[react]] / [[silent]]). This is also the
+                # path for "@SomeHuman ..." messages — the agent should normally
+                # stay silent rather than answer for the mentioned person.
+                # Circuit-breaker: cap consecutive bot-originated follow-up
+                # turns per thread to stop runaway agent-to-agent ack loops.
+                _is_bot_msg = bool(event.get("bot_id") or event.get("subtype") == "bot_message")
+                _cb = getattr(self, "_followup_bot_turns", None)
+                if _cb is None:
+                    _cb = self._followup_bot_turns = {}
+                if _is_bot_msg:
+                    _cb[event_thread_ts] = _cb.get(event_thread_ts, 0) + 1
+                    if _cb[event_thread_ts] > 3:
+                        logger.info("[Slack] follow-up circuit-breaker tripped for thread %s", event_thread_ts)
+                        return
+                    # Bound the dict like _mentioned_threads so bot-only threads
+                    # (never reset by a human turn) can't grow without limit.
+                    if len(_cb) > self._MENTIONED_THREADS_MAX:
+                        for _old in list(_cb)[:self._MENTIONED_THREADS_MAX // 2]:
+                            _cb.pop(_old, None)
                 else:
-                    return  # Strict mode: ignore until @-mentioned again
-            elif not is_mentioned:
+                    _cb.pop(event_thread_ts, None)  # human turn resets the counter
+                _followup_decision = True
+            elif self._slack_strict_mention():
+                return  # Strict mode: not mentioned, not a bot thread → ignore
+            else:
+                # Non-strict: respond if the bot started/was mentioned in this
+                # thread, or there's an active session for it.
                 reply_to_bot_thread = (
                     is_thread_reply and event_thread_ts in self._bot_message_ts
                 )
@@ -3836,6 +3864,43 @@ class SlackAdapter(BasePlatformAdapter):
             except Exception:  # pragma: no cover - defensive
                 reply_to_text = None
 
+        # For the relevance classifier: signal when the bot has an ongoing
+        # session in this thread so "what time is it?" or follow-up questions
+        # are correctly classified as RELEVANT rather than human chatter.
+        channel_context = None
+        if is_thread_reply:
+            try:
+                if self._has_active_session_for_thread(
+                    channel_id=channel_id,
+                    thread_ts=event_thread_ts,
+                    user_id=user_id,
+                ):
+                    channel_context = (
+                        "The bot has an active ongoing conversation in this thread "
+                        "and has been responding to messages here."
+                    )
+            except Exception:
+                pass
+
+        # When this is a triage follow-up that @-mentions someone OTHER than the
+        # bot, tell the agent explicitly so it doesn't answer on that person's
+        # behalf (prod bug: "@Matteo are you available?" → bot said "Yes").
+        if _followup_decision and _other_user_mentioned:
+            _other_uids = [u for u in _mentioned_uids if u != bot_uid]
+            _names = []
+            for _u in _other_uids:
+                try:
+                    _names.append(await self._resolve_user_name(_u, chat_id=channel_id) or _u)
+                except Exception:
+                    _names.append(_u)
+            _who = ", ".join(_names) if _names else "another person"
+            _note = (
+                f"NOTE: This message is addressed to {_who}, NOT to you. "
+                "You are not that person — do not answer on their behalf. "
+                "Stay [[silent]] unless you are separately and clearly being asked."
+            )
+            channel_context = f"{channel_context}\n{_note}" if channel_context else _note
+
         msg_event = MessageEvent(
             text=text,
             message_type=msg_type,
@@ -3846,6 +3911,7 @@ class SlackAdapter(BasePlatformAdapter):
             media_types=media_types,
             reply_to_message_id=thread_ts if thread_ts != ts else None,
             channel_prompt=_channel_prompt,
+            channel_context=channel_context,
             reply_to_text=reply_to_text,
             auto_skill=_auto_skill,
             metadata={

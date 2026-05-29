@@ -1819,6 +1819,15 @@ class MessageEvent:
     # particular key existing.
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    # Set by platform adapters when the bot is directly @-mentioned in the
+    # message text. Currently used by Slack strict_mention gating; preserved
+    # for future cross-platform mention-based routing logic.
+    directly_mentioned: bool = False
+
+    # Set by Slack thread_followup_mode=agent: this is a non-mention follow-up
+    # the agent must triage (reply normally / [[react:emoji]] / [[silent]]).
+    is_followup_decision: bool = False
+
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
     
@@ -5067,6 +5076,27 @@ class BasePlatformAdapter(ABC):
                 response = None
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
+            if response and getattr(event, "is_followup_decision", False):
+                # Agent-decision sentinels (Slack thread_followup_mode=agent):
+                # [[silent]] suppresses the reply entirely; [[react:emoji]]
+                # suppresses the text and adds a single emoji reaction instead.
+                # Gated on is_followup_decision so a normal reply that happens
+                # to contain the marker text isn't accidentally dropped.
+                _decider = getattr(self, "_apply_decision_reaction", None)
+                if "[[silent]]" in response:
+                    logger.info("[%s] Agent chose [[silent]] — suppressing reply", self.name)
+                    response = None
+                else:
+                    _rm = re.search(r"\[\[react:\s*:?([a-z0-9_+\-]+):?\s*\]\]", response)
+                    if _rm:
+                        emoji = _rm.group(1)
+                        logger.info("[%s] Agent chose [[react:%s]] — reacting only", self.name, emoji)
+                        if _decider:
+                            try:
+                                await _decider(event, emoji)
+                            except Exception as _re_err:
+                                logger.debug("[%s] decision reaction failed: %s", self.name, _re_err)
+                        response = None
             if response:
                 # Capture [[as_document]] before extract_media strips it, so the
                 # dispatch partition below can route image-extension files

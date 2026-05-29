@@ -11554,6 +11554,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if getattr(event, "channel_context", None):
             message_text = f"{event.channel_context}\n\n[New message]\n{message_text}"
 
+        # thread_followup_mode=agent: this is a non-mention follow-up in a thread
+        # the bot participates in. Tell the agent to triage its response.
+        if getattr(event, "is_followup_decision", False):
+            message_text = (
+                "[Thread follow-up — you were NOT directly @-mentioned in this "
+                "message. Decide how to respond:\n"
+                "- Reply normally ONLY if it concerns you or you can genuinely help.\n"
+                "- Output exactly [[react:emoji]] (e.g. [[react:+1]], [[react:eyes]], "
+                "[[react:pray]]) to acknowledge with a single emoji and say nothing.\n"
+                "- Output exactly [[silent]] if this is a conversation between others "
+                "that does not need you.\n"
+                "Pick the lightest appropriate option; do not be chatty.]\n\n"
+                f"{message_text}"
+            )
+
         # Declare at outer scope so the audio-file-paths handling block below
         # remains safe when ``event.media_urls`` is empty (no inner block runs).
         audio_file_paths: list[str] = []

@@ -3436,9 +3436,10 @@ class SlackAdapter(BasePlatformAdapter):
             _in_thread = self._in_bot_thread(
                 event_thread_ts, channel_id, user_id, is_thread_reply
             )
-            # DEBUG: capture every routing input so a misroute (e.g. answering
-            # for an @-mentioned human) is provable from logs without a repro.
-            logger.debug(
+            # Routing observability: one concise INFO line per inbound channel
+            # message so a misroute (e.g. answering for an @-mentioned human) is
+            # provable from agent.log without a repro or global DEBUG.
+            logger.info(
                 "[Slack] routing chat=%s ts=%s bot=%s is_mentioned=%s "
                 "other_mentioned=%s mentioned_uids=%s thread_reply=%s "
                 "in_bot_thread=%s strict=%s followup_mode=%s",

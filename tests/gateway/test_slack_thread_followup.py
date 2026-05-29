@@ -63,6 +63,17 @@ from gateway.platforms.slack import SlackAdapter  # noqa: E402
 # full _process_message_background path (which needs a live AsyncWebClient).
 _REACT_RE = re.compile(r"\[\[react:\s*:?([a-z0-9_+\-]+):?\s*\]\]")
 
+# The mention-parse regex used in slack.py handle_event routing.
+_MENTION_RE = re.compile(r"<@([A-Z0-9]+)>")
+
+
+def _route_mentions(text: str, bot_uid: str):
+    """Mirror slack.py's routing booleans for @-mention handling."""
+    uids = set(_MENTION_RE.findall(text))
+    is_mentioned = bool(bot_uid and bot_uid in uids)
+    other = bool(uids - ({bot_uid} if bot_uid else set()))
+    return is_mentioned, other
+
 
 def _make_adapter(extra: dict) -> SlackAdapter:
     adapter = object.__new__(SlackAdapter)
@@ -165,6 +176,40 @@ def test_plain_reply_has_no_sentinel():
     text = "Sure, the deploy finished at 10:00."
     assert "[[silent]]" not in text
     assert _REACT_RE.search(text) is None
+
+
+# ---- @-mention routing edge cases (prod bug: bot answered for @Matteo) ------
+
+BOT = "U0AH8J6H5A9"   # LaHermes bot_user_id
+MATTEO = "U01QBQA0YDT"  # a human
+
+
+def test_mention_bot_only_is_addressed():
+    is_m, other = _route_mentions(f"<@{BOT}> what's up", BOT)
+    assert is_m is True and other is False
+
+
+def test_mention_other_human_only_not_addressed():
+    # The exact prod case: bot must NOT be considered addressed.
+    is_m, other = _route_mentions(f"<@{MATTEO}> are you available at 9pm?", BOT)
+    assert is_m is False and other is True
+
+
+def test_mention_bot_and_human_bot_wins():
+    # Bot mentioned alongside a human → bot IS addressed, should reply.
+    is_m, other = _route_mentions(f"<@{BOT}> <@{MATTEO}> can you two sync?", BOT)
+    assert is_m is True and other is True
+
+
+def test_mention_none_is_plain_followup():
+    is_m, other = _route_mentions("anyone up for lunch?", BOT)
+    assert is_m is False and other is False
+
+
+def test_mention_here_channel_not_bot():
+    # @here / @channel are not <@Uxxx> tokens → not a bot mention.
+    is_m, other = _route_mentions("<!here> standup in 5", BOT)
+    assert is_m is False and other is False
 
 
 # ---- sentinel parsing is unconditional (regression: [[silent]] leak) -------

@@ -222,20 +222,38 @@ import inspect  # noqa: E402
 from gateway.platforms import base as _base_mod  # noqa: E402
 
 
-def _send_chokepoint_source() -> str:
-    src = inspect.getsource(_base_mod.BasePlatformAdapter)
-    i = src.index("[[silent]]")
-    # the `if response:` guard that opens the sentinel block sits just above
-    return src[max(0, i - 600):i]
+def _decision_filter_source() -> str:
+    return inspect.getsource(_base_mod.BasePlatformAdapter._consume_decision_sentinels)
 
 
-def test_sentinel_block_not_gated_on_followup_flag():
-    """The sentinel-parsing block must NOT be gated on is_followup_decision."""
-    head = _send_chokepoint_source()
-    # The guard immediately preceding the [[silent]] check is a bare
-    # `if response:` — not `if response and ... is_followup_decision`.
-    assert "is_followup_decision" not in head, (
-        "sentinel parsing is gated on is_followup_decision again — a [[silent]]/"
-        "[[react]] emitted outside triage will leak as visible text"
+def test_sentinel_filter_is_unconditional():
+    """The shared decision-sentinel filter must parse [[silent]]/[[react]]
+    unconditionally — never gated on is_followup_decision, or a token emitted
+    outside a triage turn leaks into the channel as visible text (prod
+    2026-05-29)."""
+    body = _decision_filter_source()
+    assert "is_followup_decision" not in body, (
+        "decision-sentinel parsing is gated on is_followup_decision again — a "
+        "[[silent]]/[[react]] emitted outside triage will leak as visible text"
     )
-    assert "if response:" in head
+    assert "[[silent]]" in body
+    assert "[[react" in body
+
+
+def test_every_slack_egress_runs_the_decision_filter():
+    """BOTH Slack egress paths must route through _consume_decision_sentinels:
+    the base.py chokepoint AND the run.py queued-follow-up resend. The resend
+    path bypassing the filter is what leaked a literal [[react:eyes]] in prod
+    (queued follow-up + streaming.enabled=false)."""
+    chokepoint = inspect.getsource(
+        _base_mod.BasePlatformAdapter._process_message_background
+    )
+    assert "_consume_decision_sentinels" in chokepoint, (
+        "base.py chokepoint no longer routes through the shared sentinel filter"
+    )
+    from gateway import run as _run_mod  # noqa: PLC0415
+    resend = inspect.getsource(_run_mod.GatewayRunner._run_agent)
+    assert "_consume_decision_sentinels" in resend, (
+        "run.py queued-follow-up resend bypasses the sentinel filter — raw "
+        "[[react:...]]/[[silent]] tokens will leak on queued follow-ups"
+    )

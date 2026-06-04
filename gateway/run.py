@@ -21861,6 +21861,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     except Exception:
                         _intentional_silence = False
+                    # Fork: also apply the agent-decision sentinel filter the
+                    # chokepoint uses (base.py _consume_decision_sentinels) BEFORE
+                    # resending. This resend bypasses the chokepoint, so without it
+                    # a raw [[react:emoji]]/[[silent]] control token leaks into the
+                    # channel as visible text on queued follow-ups (the bug that
+                    # made LaHermes post a literal "[[react:eyes]]").
+                    _sentinel_suppressed = False
+                    if not _intentional_silence and first_response and not _already_streamed:
+                        _filter = getattr(adapter, "_consume_decision_sentinels", None)
+                        if _filter is not None:
+                            try:
+                                _filtered = await _filter(
+                                    first_response,
+                                    chat_id=source.chat_id,
+                                    message_id=event_message_id,
+                                )
+                                _sentinel_suppressed = bool(first_response) and not _filtered
+                                first_response = _filtered
+                            except Exception as e:
+                                logger.debug("decision-sentinel filter failed on resend: %s", e)
                     if _intentional_silence:
                         logger.info(
                             "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
@@ -21879,6 +21899,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
+                    elif _sentinel_suppressed:
+                        logger.info(
+                            "Queued follow-up for session %s: suppressed decision-sentinel resend (no visible text).",
+                            session_key or "?",
+                        )
                     elif first_response:
                         logger.info(
                             "Queued follow-up for session %s: skipping resend because final streamed delivery was confirmed.",

@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 import uuid
+from types import SimpleNamespace
 from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
@@ -4991,6 +4992,50 @@ class BasePlatformAdapter(ABC):
             max_ms = 2500
         return random.uniform(min_ms / 1000.0, max_ms / 1000.0)
 
+    async def _consume_decision_sentinels(
+        self, response, event=None, chat_id=None, message_id=None
+    ):
+        """Single egress filter for agent-decision control tokens
+        (``[[silent]]`` / ``[[react:emoji]]``, used by
+        ``slack.thread_followup_mode=agent``).
+
+        Returns the text to actually send, or ``None`` when the whole response
+        is a control token (in which case it fires the emoji reaction as a side
+        effect). This MUST be called by EVERY send path — the chokepoint in
+        ``_process_message_background`` AND the queued-follow-up resend in
+        ``run.py`` ``_run_agent`` — so a raw token can never leak into the
+        channel as visible text. (Regression: LaHermes posted a literal
+        ``[[react:eyes]]`` because the queued-follow-up resend bypassed the
+        chokepoint parser while ``streaming.enabled`` was false.)
+
+        Pass ``event`` when available (chokepoint); otherwise pass ``chat_id``
+        and ``message_id`` (resend path, which only has the ``SessionSource``).
+        """
+        if not response:
+            return response
+        if "[[silent]]" in response:
+            logger.info("[%s] Agent chose [[silent]] — suppressing reply", self.name)
+            return None
+        _rm = re.search(r"\[\[react:\s*:?([a-z0-9_+\-]+):?\s*\]\]", response)
+        if not _rm:
+            return response
+        emoji = _rm.group(1)
+        logger.info("[%s] Agent chose [[react:%s]] — reacting only", self.name, emoji)
+        _decider = getattr(self, "_apply_decision_reaction", None)
+        if _decider is not None:
+            _evt = event
+            if _evt is None and (chat_id or message_id):
+                _evt = SimpleNamespace(
+                    message_id=message_id,
+                    source=SimpleNamespace(chat_id=chat_id),
+                )
+            if _evt is not None:
+                try:
+                    await _decider(_evt, emoji)
+                except Exception as _re_err:
+                    logger.debug("[%s] decision reaction failed: %s", self.name, _re_err)
+        return None
+
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         # Track delivery outcomes for the processing-complete hook
@@ -5082,24 +5127,12 @@ class BasePlatformAdapter(ABC):
                 # ANY turn, not only triage follow-ups (e.g. a direct @-mention it
                 # decides not to answer). Parse unconditionally so a raw token can
                 # never leak into the channel as visible text (the bug that made
-                # LaHermes post a literal "[[silent]]" message).
+                # LaHermes post a literal "[[silent]]" message). Shared filter so
+                # the queued-follow-up resend in run.py applies the exact same
+                # parse — see _consume_decision_sentinels.
                 #   [[silent]]        → suppress the reply entirely
                 #   [[react:emoji]]   → suppress text, add one emoji reaction
-                _decider = getattr(self, "_apply_decision_reaction", None)
-                if "[[silent]]" in response:
-                    logger.info("[%s] Agent chose [[silent]] — suppressing reply", self.name)
-                    response = None
-                else:
-                    _rm = re.search(r"\[\[react:\s*:?([a-z0-9_+\-]+):?\s*\]\]", response)
-                    if _rm:
-                        emoji = _rm.group(1)
-                        logger.info("[%s] Agent chose [[react:%s]] — reacting only", self.name, emoji)
-                        if _decider:
-                            try:
-                                await _decider(event, emoji)
-                            except Exception as _re_err:
-                                logger.debug("[%s] decision reaction failed: %s", self.name, _re_err)
-                        response = None
+                response = await self._consume_decision_sentinels(response, event=event)
             if response:
                 # Capture [[as_document]] before extract_media strips it, so the
                 # dispatch partition below can route image-extension files

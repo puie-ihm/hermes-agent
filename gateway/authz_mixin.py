@@ -404,6 +404,29 @@ class GatewayAuthorizationMixin:
             Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
             Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
         }
+        # DM-scoped allowlist: when set, gates DM access independently of the
+        # platform-wide allowlist or ALLOW_ALL flag. Lets an operator run an
+        # open bot in channels while keeping DMs (incl. Slack Assistant) locked
+        # to a small list. (#dm-allowlist)
+        platform_dm_user_env_map = {
+            Platform.TELEGRAM: "TELEGRAM_DM_ALLOWED_USERS",
+            Platform.DISCORD: "DISCORD_DM_ALLOWED_USERS",
+            Platform.WHATSAPP: "WHATSAPP_DM_ALLOWED_USERS",
+            Platform.SLACK: "SLACK_DM_ALLOWED_USERS",
+            Platform.SIGNAL: "SIGNAL_DM_ALLOWED_USERS",
+            Platform.EMAIL: "EMAIL_DM_ALLOWED_USERS",
+            Platform.SMS: "SMS_DM_ALLOWED_USERS",
+            Platform.MATTERMOST: "MATTERMOST_DM_ALLOWED_USERS",
+            Platform.MATRIX: "MATRIX_DM_ALLOWED_USERS",
+            Platform.DINGTALK: "DINGTALK_DM_ALLOWED_USERS",
+            Platform.FEISHU: "FEISHU_DM_ALLOWED_USERS",
+            Platform.WECOM: "WECOM_DM_ALLOWED_USERS",
+            Platform.WECOM_CALLBACK: "WECOM_CALLBACK_DM_ALLOWED_USERS",
+            Platform.WEIXIN: "WEIXIN_DM_ALLOWED_USERS",
+            Platform.BLUEBUBBLES: "BLUEBUBBLES_DM_ALLOWED_USERS",
+            Platform.QQBOT: "QQ_DM_ALLOWED_USERS",
+            Platform.YUANBAO: "YUANBAO_DM_ALLOWED_USERS",
+        }
         platform_allow_all_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
             Platform.DISCORD: "DISCORD_ALLOW_ALL_USERS",
@@ -437,6 +460,38 @@ class GatewayAuthorizationMixin:
                         platform_allow_all_map[source.platform] = entry.allow_all_env
             except Exception:
                 pass
+
+        # DM-scoped allowlist takes precedence for DMs. When set, it is the
+        # sole gate for DM access — even if PLATFORM_ALLOW_ALL_USERS=true.
+        # This enables the common pattern: open bot in channels (anyone can
+        # @mention) while DMs are locked to a small allowlist. Pairing-store
+        # approvals still pass — they are explicit per-user grants.
+        if source.chat_type == "dm":
+            dm_env = platform_dm_user_env_map.get(source.platform, "")
+            dm_raw = os.getenv(dm_env, "").strip() if dm_env else ""
+            if dm_raw:
+                platform_name = source.platform.value if source.platform else ""
+                if self.pairing_store.is_approved(platform_name, user_id):
+                    return True
+                allowed_dm_ids = {
+                    uid.strip() for uid in dm_raw.split(",") if uid.strip()
+                }
+                if "*" in allowed_dm_ids:
+                    return True
+                dm_check_ids = {user_id}
+                if "@" in user_id:
+                    dm_check_ids.add(user_id.split("@")[0])
+                if source.platform == Platform.WHATSAPP:
+                    normalized_allowed = set()
+                    for aid in allowed_dm_ids:
+                        normalized_allowed.update(_expand_whatsapp_auth_aliases(aid))
+                    if normalized_allowed:
+                        allowed_dm_ids = normalized_allowed
+                    dm_check_ids.update(_expand_whatsapp_auth_aliases(user_id))
+                    normalized_user_id = _normalize_whatsapp_identifier(user_id)
+                    if normalized_user_id:
+                        dm_check_ids.add(normalized_user_id)
+                return bool(dm_check_ids & allowed_dm_ids)
 
         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
         platform_allow_all_var = platform_allow_all_map.get(source.platform, "")
@@ -713,7 +768,28 @@ class GatewayAuthorizationMixin:
                 ),
                 Platform.QQBOT: ("QQ_GROUP_ALLOWED_USERS",),
             }
+            # DM-scoped allowlist also signals intent to restrict DM access.
+            platform_dm_env_map = {
+                Platform.TELEGRAM: "TELEGRAM_DM_ALLOWED_USERS",
+                Platform.DISCORD:  "DISCORD_DM_ALLOWED_USERS",
+                Platform.WHATSAPP: "WHATSAPP_DM_ALLOWED_USERS",
+                Platform.SLACK:    "SLACK_DM_ALLOWED_USERS",
+                Platform.SIGNAL:   "SIGNAL_DM_ALLOWED_USERS",
+                Platform.EMAIL:    "EMAIL_DM_ALLOWED_USERS",
+                Platform.SMS:      "SMS_DM_ALLOWED_USERS",
+                Platform.MATTERMOST: "MATTERMOST_DM_ALLOWED_USERS",
+                Platform.MATRIX:   "MATRIX_DM_ALLOWED_USERS",
+                Platform.DINGTALK: "DINGTALK_DM_ALLOWED_USERS",
+                Platform.FEISHU:   "FEISHU_DM_ALLOWED_USERS",
+                Platform.WECOM:    "WECOM_DM_ALLOWED_USERS",
+                Platform.WECOM_CALLBACK: "WECOM_CALLBACK_DM_ALLOWED_USERS",
+                Platform.WEIXIN:   "WEIXIN_DM_ALLOWED_USERS",
+                Platform.BLUEBUBBLES: "BLUEBUBBLES_DM_ALLOWED_USERS",
+                Platform.QQBOT:    "QQ_DM_ALLOWED_USERS",
+            }
             if os.getenv(platform_env_map.get(platform, ""), "").strip():
+                return "ignore"
+            if os.getenv(platform_dm_env_map.get(platform, ""), "").strip():
                 return "ignore"
             for env_key in platform_group_env_map.get(platform, ()):
                 if os.getenv(env_key, "").strip():

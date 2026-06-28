@@ -52,10 +52,10 @@ def _ensure_slack_mock():
 
 _ensure_slack_mock()
 
-import gateway.platforms.slack as _slack_mod  # noqa: E402
+import plugins.platforms.slack.adapter as _slack_mod  # noqa: E402
 _slack_mod.SLACK_AVAILABLE = True
 
-from gateway.platforms.slack import SlackAdapter  # noqa: E402
+from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
 
 
 # The exact regex used in gateway/platforms/base.py to parse [[react:emoji]].
@@ -252,7 +252,12 @@ def test_every_slack_egress_runs_the_decision_filter():
         "base.py chokepoint no longer routes through the shared sentinel filter"
     )
     from gateway import run as _run_mod  # noqa: PLC0415
+    # Upstream split _run_agent into a thin wrapper that delegates to
+    # _run_agent_inner, where the queued-follow-up resend now lives. Inspect
+    # both so this guard survives that refactor (and any future re-split).
     resend = inspect.getsource(_run_mod.GatewayRunner._run_agent)
+    if hasattr(_run_mod.GatewayRunner, "_run_agent_inner"):
+        resend += inspect.getsource(_run_mod.GatewayRunner._run_agent_inner)
     assert "_consume_decision_sentinels" in resend, (
         "run.py queued-follow-up resend bypasses the sentinel filter — raw "
         "[[react:...]]/[[silent]] tokens will leak on queued follow-ups"

@@ -155,6 +155,13 @@ class GatewayKanbanWatchersMixin:
                 "kanban notifier: disabled via config kanban.dispatch_in_gateway=false"
             )
             return
+        # Whether to push worker-referenced local files as native uploads on
+        # completion (kanban.notify_artifact_uploads). A locked-down deployment
+        # can turn this off so the notifier never exfiltrates on-disk files a
+        # prompt-injected worker named in its handoff. Default on.
+        notify_artifact_uploads = bool(
+            kanban_cfg.get("notify_artifact_uploads", True)
+        )
         from gateway.config import Platform as _Platform
         try:
             from hermes_cli import kanban_db as _kb
@@ -412,6 +419,13 @@ class GatewayKanbanWatchersMixin:
                             sub["task_id"], sub["platform"],
                             sub["chat_id"], sub.get("thread_id") or "",
                         )
+                        # Redact at the egress boundary: notifier messages
+                        # embed worker-authored text (handoff summaries, and —
+                        # in the gave_up branch — raw spawn-error output) that
+                        # can carry secrets. force=True so this holds
+                        # regardless of the global redaction preference.
+                        from agent.redact import redact_sensitive_text
+                        msg = redact_sensitive_text(msg, force=True)
                         try:
                             await adapter.send(
                                 sub["chat_id"], msg, metadata=metadata,
@@ -429,7 +443,7 @@ class GatewayKanbanWatchersMixin:
                             # ``send_document`` / ``send_image_file`` uploads
                             # them. Only fires on the ``completed`` event so
                             # we never spam attachments on retries.
-                            if kind == "completed":
+                            if kind == "completed" and notify_artifact_uploads:
                                 try:
                                     await self._deliver_kanban_artifacts(
                                         adapter=adapter,

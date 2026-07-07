@@ -2688,6 +2688,15 @@ DEFAULT_CONFIG = {
         # unrestricted; empty ``{}`` (default) disables the policy entirely
         # (backward compatible).
         "assignee_allowlist": {},
+        # Per-profile task visibility scoping. A list of creator profiles that
+        # may only see and mutate tasks they created:
+        # ``["front_external"]``. When a listed profile calls the kanban tools,
+        # foreign tasks are worded as "not found" (no id enumeration) and its
+        # created tasks are forced to scratch workspaces. Empty ``[]`` (default)
+        # means no scoping (backward compatible). Dispatcher-spawned workers
+        # (``HERMES_KANBAN_TASK`` set) keep their existing task-ownership
+        # scoping and are never restricted by this list.
+        "restrict_to_own_tasks": [],
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

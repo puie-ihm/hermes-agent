@@ -2795,12 +2795,16 @@ def list_tasks(
     order_by: Optional[str] = None,
     workflow_template_id: Optional[str] = None,
     current_step_key: Optional[str] = None,
+    created_by: Optional[str] = None,
 ) -> list[Task]:
     query = "SELECT * FROM tasks WHERE 1=1"
     params: list[Any] = []
     if assignee is not None:
         query += " AND assignee = ?"
         params.append(_canonical_assignee(assignee))
+    if created_by is not None:
+        query += " AND created_by = ?"
+        params.append(created_by)
     if status is not None:
         if status not in VALID_STATUSES:
             raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")

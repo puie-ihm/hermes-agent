@@ -4766,3 +4766,131 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Assignee allowlist (kanban.assignee_allowlist) — server-side hard-pin
+# ---------------------------------------------------------------------------
+
+_PIN = {"front_external": frozenset({"ext_data_analyst"})}
+
+
+def test_allowlist_blocks_disallowed_assignee(kanban_home, all_assignees_spawnable):
+    """A task whose (created_by -> assignee) violates the allowlist is
+    hard-pinned: it lands in ``policy_blocked``, is not spawned, and is
+    transitioned ready -> blocked with an audit event."""
+    spawns = []
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="leak", assignee="media_buyer",
+            created_by="front_external",
+        )
+        res = kb.dispatch_once(
+            conn, spawn_fn=lambda task, ws: spawns.append(task.id),
+            assignee_allowlist=_PIN,
+        )
+        assert (t, "front_external", "media_buyer") in res.policy_blocked
+        assert spawns == []
+        assert kb.get_task(conn, t).status == "blocked"
+        events = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ?", (t,)
+        ).fetchall()
+        assert any(e["kind"] == "policy_violation" for e in events)
+
+
+def test_allowlist_allows_pinned_assignee(kanban_home, all_assignees_spawnable):
+    """The pinned assignee for a restricted creator spawns normally."""
+    spawns = []
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="ok", assignee="ext_data_analyst",
+            created_by="front_external",
+        )
+        res = kb.dispatch_once(
+            conn, spawn_fn=lambda task, ws: spawns.append(task.id),
+            assignee_allowlist=_PIN,
+        )
+        assert not res.policy_blocked
+        assert spawns == [t]
+        assert kb.get_task(conn, t).status == "running"
+
+
+def test_allowlist_ignores_unlisted_creator(kanban_home, all_assignees_spawnable):
+    """Creators absent from the allowlist are unrestricted."""
+    spawns = []
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="free", assignee="media_buyer",
+            created_by="buyer_ops",
+        )
+        res = kb.dispatch_once(
+            conn, spawn_fn=lambda task, ws: spawns.append(task.id),
+            assignee_allowlist=_PIN,
+        )
+        assert not res.policy_blocked
+        assert spawns == [t]
+
+
+def test_allowlist_autoloads_from_config(kanban_home, all_assignees_spawnable):
+    """When ``assignee_allowlist`` param is None, the policy is read from
+    ``kanban.assignee_allowlist`` in config.yaml."""
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n"
+        "  assignee_allowlist:\n"
+        "    front_external:\n"
+        "      - ext_data_analyst\n",
+        encoding="utf-8",
+    )
+    spawns = []
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="leak", assignee="media_buyer",
+            created_by="front_external",
+        )
+        res = kb.dispatch_once(
+            conn, spawn_fn=lambda task, ws: spawns.append(task.id),
+        )  # assignee_allowlist defaults to None -> load from config
+        assert (t, "front_external", "media_buyer") in res.policy_blocked
+        assert spawns == []
+
+
+def test_allowlist_blocks_default_assignee_backfill(
+    kanban_home, all_assignees_spawnable
+):
+    """An unassigned task from a restricted creator is still enforced after
+    ``kanban.default_assignee`` backfills the assignee at dispatch."""
+    spawns = []
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="floater", created_by="front_external",
+        )  # no assignee
+        res = kb.dispatch_once(
+            conn, spawn_fn=lambda task, ws: spawns.append(task.id),
+            default_assignee="media_buyer",
+            assignee_allowlist=_PIN,
+        )
+        assert (t, "front_external", "media_buyer") in res.policy_blocked
+        assert spawns == []
+        assert kb.get_task(conn, t).status == "blocked"
+
+
+def test_allowlist_blocks_in_review_lane(kanban_home, all_assignees_spawnable):
+    """The same hard-pin applies in the review-dispatch lane: a review task
+    with a disallowed (created_by -> assignee) pairing is never spawned."""
+    spawns = []
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="rev", assignee="media_buyer",
+            created_by="front_external",
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'review', claim_lock = NULL WHERE id = ?",
+            (t,),
+        )
+        conn.commit()
+        res = kb.dispatch_once(
+            conn, spawn_fn=lambda task, ws: spawns.append(task.id),
+            assignee_allowlist=_PIN,
+        )
+        assert (t, "front_external", "media_buyer") in res.policy_blocked
+        assert spawns == []

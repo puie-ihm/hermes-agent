@@ -132,6 +132,25 @@ def _stamp_worker_session_metadata(
     return stamped
 
 
+def _creator_profile() -> str:
+    """Trusted identity of the calling process.
+
+    Prefers ``HERMES_PROFILE`` (set by the launcher); otherwise derives the
+    profile name from ``HERMES_HOME`` via ``get_active_profile_name``. Falls
+    back to ``"worker"`` only when neither is resolvable. This is the identity
+    stamped as ``created_by`` and matched against ``kanban.assignee_allowlist``,
+    so it must never be empty.
+    """
+    prof = (os.environ.get("HERMES_PROFILE") or "").strip()
+    if prof:
+        return prof
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        return get_active_profile_name() or "worker"
+    except Exception:
+        return "worker"
+
+
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     """Reject worker-driven destructive calls on foreign task IDs.
 
@@ -846,6 +865,21 @@ def _handle_create(args: dict, **kw) -> str:
             "assignee is required — name the profile that should execute this "
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
+    # Layer-1 assignee allowlist (hard-pin): a prompt-injected creator must not
+    # be able to route work to an off-limits worker. Enforced against the
+    # trusted process identity, not any caller-supplied field.
+    creator = _creator_profile()
+    try:
+        from hermes_cli.kanban_db import (
+            load_assignee_allowlist, assignee_policy_violation,
+        )
+        violation = assignee_policy_violation(
+            load_assignee_allowlist(), creator, assignee
+        )
+    except Exception:
+        violation = None
+    if violation:
+        return tool_error(f"kanban_create: {violation}")
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
@@ -931,7 +965,7 @@ def _handle_create(args: dict, **kw) -> str:
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
-                created_by=os.environ.get("HERMES_PROFILE") or "worker",
+                created_by=creator,
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
@@ -1030,6 +1064,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         notifier_profile = (
             get_session_env("HERMES_SESSION_PROFILE", "")
             or os.environ.get("HERMES_PROFILE")
+            or _creator_profile()
         )
 
         # Lazy-import to keep the module-level dependency light

@@ -2903,6 +2903,14 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Server-side assignee allowlist (hard-pin). Maps a creator profile to
+        # the set of assignees it is permitted to create/dispatch tasks for:
+        # ``{"front_external": ["ext_data_analyst"]}``. Enforced at task
+        # creation AND at dispatch, so a prompt-injected creator can't route
+        # work to an off-limits worker. Creators absent from the map are
+        # unrestricted; empty ``{}`` (default) disables the policy entirely
+        # (backward compatible).
+        "assignee_allowlist": {},
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

@@ -2384,6 +2384,68 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _norm_profile_or_empty(name: Any) -> str:
+    """Normalize a profile name, mapping empty/None to ``""`` instead of raising.
+
+    ``normalize_profile_name`` raises ``ValueError`` on an empty string; the
+    allowlist helpers must tolerate NULL ``created_by`` / missing assignees
+    (legacy rows, unrouted tasks) without blowing up the dispatch loop, so we
+    funnel through this guard.
+    """
+    from hermes_cli.profiles import normalize_profile_name
+
+    s = str(name or "").strip()
+    if not s:
+        return ""
+    return normalize_profile_name(s)
+
+
+def load_assignee_allowlist(cfg=None):
+    """Parse ``kanban.assignee_allowlist`` into ``{creator: frozenset(assignees)}``.
+
+    Names are normalized via ``normalize_profile_name`` so they match the
+    ``assignee`` / ``created_by`` columns. Malformed entries are dropped. An
+    empty dict means "no policy" (backward compatible — nothing is restricted).
+    """
+    try:
+        if cfg is None:
+            from hermes_cli.config import load_config
+            cfg = load_config()
+        from hermes_cli.config import cfg_get
+        raw = cfg_get(cfg, "kanban", "assignee_allowlist", default={}) or {}
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for creator, allowed in raw.items():
+        if not isinstance(allowed, (list, tuple)):
+            continue
+        creator_key = _norm_profile_or_empty(creator)
+        if not creator_key:
+            continue
+        vals = frozenset(
+            _norm_profile_or_empty(a) for a in allowed if str(a).strip()
+        )
+        out[creator_key] = vals
+    return out
+
+
+def assignee_policy_violation(allowlist, created_by, assignee):
+    """Return a human-readable reason when ``created_by -> assignee`` violates
+    the allowlist, else ``None``. Creators absent from the map are unrestricted.
+    """
+    if not allowlist:
+        return None
+    allowed = allowlist.get(_norm_profile_or_empty(created_by))
+    if allowed is None:
+        return None
+    if _norm_profile_or_empty(assignee) in allowed:
+        return None
+    return (f"assignee {assignee!r} is not permitted for tasks created by "
+            f"{created_by!r} (kanban.assignee_allowlist allows: {sorted(allowed)})")
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -6079,6 +6141,12 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    policy_blocked: list = field(default_factory=list)
+    """Tasks the dispatcher refused to spawn because
+    ``(created_by -> assignee)`` violates ``kanban.assignee_allowlist``. Each
+    entry is ``(task_id, created_by, assignee)``. Server-side hard-pin backstop:
+    even if a prompt-injected creator slipped a mis-assigned task past the
+    creation-time check, the dispatcher will not spawn a worker for it."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -7449,6 +7517,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    assignee_allowlist=None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -7483,6 +7552,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            assignee_allowlist=assignee_allowlist,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -7499,6 +7569,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            assignee_allowlist=assignee_allowlist,
         )
 
 
@@ -7515,6 +7586,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    assignee_allowlist=None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -7547,6 +7619,13 @@ def _dispatch_once_locked(
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
+
+    # Server-side assignee hard-pin. Loaded once per tick; empty dict = no
+    # policy (backward compatible). Applied in both the ready and review lanes
+    # so a mis-assigned task never spawns a worker even if it slipped past the
+    # creation-time check.
+    if assignee_allowlist is None:
+        assignee_allowlist = load_assignee_allowlist()
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
@@ -7589,7 +7668,7 @@ def _dispatch_once_locked(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, created_by FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -7691,6 +7770,30 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
+        # Server-side hard-pin: refuse to spawn a task whose finalized
+        # (created_by -> assignee) pairing violates kanban.assignee_allowlist.
+        # block_task moves ready -> blocked so the task doesn't loop back into
+        # ready_rows next tick; the policy_violation event is the audit trail.
+        violation = assignee_policy_violation(
+            assignee_allowlist, row["created_by"], row_assignee
+        )
+        if violation is not None:
+            result.policy_blocked.append(
+                (row["id"], row["created_by"] or "", row_assignee)
+            )
+            if not dry_run and block_task(
+                conn, row["id"], reason=violation, kind="needs_input"
+            ):
+                with write_txn(conn):
+                    _append_event(
+                        conn, row["id"], "policy_violation",
+                        {
+                            "reason": violation,
+                            "created_by": row["created_by"],
+                            "assignee": row_assignee,
+                        },
+                    )
+            continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
@@ -7831,7 +7934,7 @@ def _dispatch_once_locked(
     # against max_spawn alongside ready tasks, so the total number of
     # running workers stays bounded.
     review_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, created_by FROM tasks "
         "WHERE status = 'review' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -7840,6 +7943,18 @@ def _dispatch_once_locked(
             break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
+            continue
+        # Same hard-pin as the ready lane: never spawn a review worker for a
+        # task whose (created_by -> assignee) pairing is off-limits. See the
+        # note in block_task — a 'review' task is outside block_task's
+        # running/ready transition set, so we can only record + skip it here.
+        violation = assignee_policy_violation(
+            assignee_allowlist, row["created_by"], row["assignee"]
+        )
+        if violation is not None:
+            result.policy_blocked.append(
+                (row["id"], row["created_by"] or "", row["assignee"])
+            )
             continue
         try:
             from hermes_cli.profiles import profile_exists

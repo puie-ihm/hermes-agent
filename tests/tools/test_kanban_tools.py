@@ -2790,3 +2790,168 @@ def test_create_stamps_created_by_from_hermes_home(monkeypatch, tmp_path):
     finally:
         conn.close()
     assert task.created_by == "ext_data_analyst"
+
+
+# ---------------------------------------------------------------------------
+# Per-profile task visibility scoping (kanban.restrict_to_own_tasks)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def restricted_env(monkeypatch, tmp_path):
+    """A visibility-restricted creator (``front_external``) plus a foreign
+    task it did NOT create. Restriction is opted in via the env flag."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "front_external")
+    monkeypatch.setenv("HERMES_KANBAN_RESTRICT_TO_OWN", "1")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        foreign = kb.create_task(
+            conn, title="foreign", assignee="media_buyer",
+            created_by="buyer_ops",
+        )
+        own = kb.create_task(
+            conn, title="own", assignee="ext_data_analyst",
+            created_by="front_external",
+        )
+    finally:
+        conn.close()
+    return {"home": home, "foreign": foreign, "own": own}
+
+
+def test_restricted_cannot_show_foreign(restricted_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_show({"task_id": restricted_env["foreign"]})
+    d = json.loads(out)
+    assert d.get("error"), f"expected not-found, got {d}"
+    assert "not found" in d["error"]
+    # Own task is still visible.
+    own = json.loads(kt._handle_show({"task_id": restricted_env["own"]}))
+    assert own.get("task", {}).get("id") == restricted_env["own"]
+
+
+def test_restricted_list_filters_to_own(restricted_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_list({"limit": 50})
+    d = json.loads(out)
+    ids = [t["id"] for t in d["tasks"]]
+    assert restricted_env["own"] in ids
+    assert restricted_env["foreign"] not in ids
+
+
+@pytest.mark.parametrize("tool", ["comment", "block", "unblock", "complete", "link"])
+def test_restricted_cannot_mutate_foreign(restricted_env, tool):
+    from tools import kanban_tools as kt
+    foreign = restricted_env["foreign"]
+    if tool == "comment":
+        out = kt._handle_comment({"task_id": foreign, "body": "hi"})
+    elif tool == "block":
+        out = kt._handle_block({"task_id": foreign, "reason": "x"})
+    elif tool == "unblock":
+        out = kt._handle_unblock({"task_id": foreign})
+    elif tool == "complete":
+        out = kt._handle_complete({"task_id": foreign, "summary": "done"})
+    else:  # link
+        out = kt._handle_link({
+            "parent_id": foreign, "child_id": restricted_env["own"],
+        })
+    d = json.loads(out)
+    assert d.get("error"), f"expected not-found for {tool}, got {d}"
+    assert "not found" in d["error"]
+
+
+def test_restricted_create_rejects_foreign_parents(restricted_env, monkeypatch):
+    from tools import kanban_tools as kt
+    out = kt._handle_create({
+        "title": "child", "assignee": "ext_data_analyst",
+        "parents": [restricted_env["foreign"]],
+    })
+    d = json.loads(out)
+    assert d.get("error"), f"expected rejection, got {d}"
+    assert "not found" in d["error"]
+
+
+def test_restricted_create_forces_scratch(restricted_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    out = kt._handle_create({
+        "title": "pinned", "assignee": "ext_data_analyst",
+        "workspace_kind": "dir", "workspace_path": "/etc",
+    })
+    d = json.loads(out)
+    assert d.get("ok") is True, f"expected success, got {d}"
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, d["task_id"])
+    finally:
+        conn.close()
+    assert task.workspace_kind == "scratch"
+    assert not task.workspace_path
+
+
+def test_restriction_via_config_list(monkeypatch, tmp_path):
+    """Restriction can be driven by the config list instead of the env flag."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "front_external")
+    monkeypatch.delenv("HERMES_KANBAN_RESTRICT_TO_OWN", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    (home / "config.yaml").write_text(
+        "kanban:\n  restrict_to_own_tasks:\n    - front_external\n",
+        encoding="utf-8",
+    )
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        foreign = kb.create_task(
+            conn, title="foreign", assignee="media_buyer",
+            created_by="buyer_ops",
+        )
+    finally:
+        conn.close()
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_show({"task_id": foreign}))
+    assert d.get("error") and "not found" in d["error"]
+
+
+def test_worker_env_not_restricted(monkeypatch, tmp_path):
+    """A dispatcher-spawned worker (HERMES_KANBAN_TASK set) is never subject
+    to the visibility restriction — its existing task-ownership scoping
+    applies instead."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "front_external")
+    monkeypatch.setenv("HERMES_KANBAN_RESTRICT_TO_OWN", "1")
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        foreign = kb.create_task(
+            conn, title="foreign", assignee="media_buyer",
+            created_by="buyer_ops",
+        )
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", foreign)
+    from tools import kanban_tools as kt
+    assert kt._restricted_creator() is None
+    d = json.loads(kt._handle_show({"task_id": foreign}))
+    assert d.get("task", {}).get("id") == foreign

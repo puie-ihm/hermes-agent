@@ -151,6 +151,47 @@ def _creator_profile() -> str:
         return "worker"
 
 
+def _restricted_creator() -> Optional[str]:
+    """Profile name if this process is visibility-restricted, else ``None``.
+
+    Dispatcher-spawned workers (``HERMES_KANBAN_TASK`` set) keep their existing
+    task-ownership scoping (see :func:`_enforce_worker_task_ownership`) and are
+    never restricted here. Restriction is opted into either via the
+    ``HERMES_KANBAN_RESTRICT_TO_OWN`` env flag or by listing the profile in
+    ``kanban.restrict_to_own_tasks``.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return None
+    prof = _creator_profile()
+    if os.environ.get("HERMES_KANBAN_RESTRICT_TO_OWN", "").strip().lower() in {
+        "1", "true", "yes",
+    }:
+        return prof
+    try:
+        restricted = cfg_get(load_config(), "kanban", "restrict_to_own_tasks", default=[]) or []
+        if prof in {str(p).strip() for p in restricted}:
+            return prof
+    except Exception:
+        pass
+    return None
+
+
+def _visibility_guard(kb, conn, tid, tool_name: str) -> Optional[str]:
+    """Return a not-found-worded ``tool_error`` for tasks not created by a
+    restricted profile, else ``None``.
+
+    The wording is identical to a genuine not-found so a restricted caller
+    can't enumerate task ids by probing for a distinct "forbidden" response.
+    """
+    creator = _restricted_creator()
+    if creator is None:
+        return None
+    task = kb.get_task(conn, str(tid))
+    if task is None or (getattr(task, "created_by", None) or "") != creator:
+        return tool_error(f"{tool_name}: task {tid} not found")
+    return None
+
+
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     """Reject worker-driven destructive calls on foreign task IDs.
 
@@ -395,6 +436,9 @@ def _handle_show(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            vguard = _visibility_guard(kb, conn, tid, "kanban_show")
+            if vguard:
+                return vguard
             task = kb.get_task(conn, tid)
             if task is None:
                 return tool_error(f"task {tid} not found")
@@ -497,6 +541,7 @@ def _handle_list(args: dict, **kw) -> str:
                 tenant=tenant,
                 include_archived=include_archived,
                 limit=limit + 1,
+                created_by=_restricted_creator(),
             )
             truncated = len(rows) > limit
             tasks = rows[:limit]
@@ -611,6 +656,9 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            vguard = _visibility_guard(kb, conn, tid, "kanban_complete")
+            if vguard:
+                return vguard
             # Goal-mode pre-completion judge gate (Issue #38367).
             # Prevent workers from bypassing the auxiliary judge by
             # calling kanban_complete before acceptance criteria are met.
@@ -714,6 +762,10 @@ def _handle_block(args: dict, **kw) -> str:
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
+        vguard = _visibility_guard(kb, conn, tid, "kanban_block")
+        if vguard:
+            conn.close()
+            return vguard
         if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
             conn.close()
             return tool_error(
@@ -851,6 +903,9 @@ def _handle_comment(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            vguard = _visibility_guard(kb, conn, tid, "kanban_comment")
+            if vguard:
+                return vguard
             cid = kb.add_comment(conn, tid, author=author, body=str(body))
             return _ok(task_id=tid, comment_id=cid)
         finally:
@@ -1156,10 +1211,24 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
+    # A visibility-restricted creator can neither attach work under foreign
+    # tasks (parents are validated once the connection is open) nor point a
+    # task at an arbitrary on-disk workspace — force scratch and drop any
+    # caller-supplied path / inheritance.
+    restricted = _restricted_creator()
+    if restricted is not None:
+        workspace_kind = "scratch"
+        workspace_path = None
+        _inherit_workspace = False
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
         try:
+            if restricted is not None:
+                for _pid in parents:
+                    pguard = _visibility_guard(kb, conn, _pid, "kanban_create")
+                    if pguard:
+                        return pguard
             # Inherit the spawning worker's own task workspace when the
             # caller didn't specify one (see resolution note above).
             if _inherit_workspace:
@@ -1330,6 +1399,9 @@ def _handle_unblock(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            vguard = _visibility_guard(kb, conn, tid, "kanban_unblock")
+            if vguard:
+                return vguard
             ok = kb.unblock_task(conn, str(tid))
             if not ok:
                 return tool_error(f"could not unblock {tid} (not blocked or unknown)")
@@ -1354,6 +1426,12 @@ def _handle_link(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            # Guard BOTH endpoints so a restricted creator can't discover or
+            # attach to a foreign task from either side of the edge.
+            for _eid in (parent_id, child_id):
+                lguard = _visibility_guard(kb, conn, _eid, "kanban_link")
+                if lguard:
+                    return lguard
             kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
             return _ok(parent_id=parent_id, child_id=child_id)
         finally:

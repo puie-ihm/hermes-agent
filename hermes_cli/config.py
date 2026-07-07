@@ -2697,6 +2697,12 @@ DEFAULT_CONFIG = {
         # (``HERMES_KANBAN_TASK`` set) keep their existing task-ownership
         # scoping and are never restricted by this list.
         "restrict_to_own_tasks": [],
+        # When true (default), the notifier uploads local files a worker
+        # referenced in its completion handoff as native attachments. Set to
+        # false on locked-down deployments so the notifier never exfiltrates
+        # on-disk files a prompt-injected worker named — the text notification
+        # (redacted) still fires.
+        "notify_artifact_uploads": True,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

@@ -189,3 +189,143 @@ def test_kanban_complete_result_field_scrubbed(worker_env):
     assert run is not None
     stored = run.summary or run.result if hasattr(run, "result") else run.summary or ""
     assert secret not in (stored or "")
+
+
+# ---------------------------------------------------------------------------
+# Gateway notifier egress: redact at send + gate artifact uploads (Commit 3)
+# ---------------------------------------------------------------------------
+
+import asyncio  # noqa: E402
+
+
+class _RecordingAdapter:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, chat_id, text, metadata=None):
+        self.sent.append({"chat_id": chat_id, "text": text})
+
+
+async def _run_one_notifier_tick(monkeypatch, runner):
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay):
+        if delay == 5:
+            return None
+        runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    await runner._kanban_notifier_watcher(interval=1)
+
+
+def _make_runner(adapter):
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._kanban_sub_fail_counts = {}
+    return runner
+
+
+def _notifier_home(monkeypatch, tmp_path, config_yaml: str = ""):
+    """Isolated HERMES_HOME + board DB for a notifier-tick test."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    if config_yaml:
+        (home / "config.yaml").write_text(config_yaml, encoding="utf-8")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    return home
+
+
+def test_notifier_masks_gave_up_secret(monkeypatch, tmp_path):
+    """A gave_up event whose raw spawn-error carries secret-shaped strings
+    must be masked before the notifier text reaches the adapter."""
+    _notifier_home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_db as kb
+    secret_gh = "ghp_" + "A" * 40
+    secret_sk = "sk-" + "B" * 48
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="boom", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn, tid, "gave_up",
+                {"error": f"spawn failed: token={secret_gh} key={secret_sk}"},
+            )
+    finally:
+        conn.close()
+
+    adapter = _RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1, adapter.sent
+    text = adapter.sent[0]["text"]
+    assert "gave up" in text
+    assert secret_gh not in text
+    assert secret_sk not in text
+
+
+def test_notify_artifact_uploads_false_skips_delivery(monkeypatch, tmp_path):
+    """kanban.notify_artifact_uploads=false must suppress the artifact-upload
+    call while the (redacted) text notification still fires."""
+    _notifier_home(
+        monkeypatch, tmp_path,
+        config_yaml="kanban:\n  notify_artifact_uploads: false\n",
+    )
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="done", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.complete_task(conn, tid, summary="all finished")
+    finally:
+        conn.close()
+
+    adapter = _RecordingAdapter()
+    runner = _make_runner(adapter)
+    calls = []
+
+    async def _spy(**kwargs):
+        calls.append(kwargs)
+
+    runner._deliver_kanban_artifacts = _spy
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1, adapter.sent
+    assert calls == [], "artifact delivery must be gated off"
+
+
+def test_notify_artifact_uploads_default_on(monkeypatch, tmp_path):
+    """With no config override, the artifact-upload call still fires on a
+    completed event (default-on, backward compatible)."""
+    _notifier_home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="done", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.complete_task(conn, tid, summary="all finished")
+    finally:
+        conn.close()
+
+    adapter = _RecordingAdapter()
+    runner = _make_runner(adapter)
+    calls = []
+
+    async def _spy(**kwargs):
+        calls.append(kwargs)
+
+    runner._deliver_kanban_artifacts = _spy
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert len(calls) == 1, "artifact delivery should fire by default"

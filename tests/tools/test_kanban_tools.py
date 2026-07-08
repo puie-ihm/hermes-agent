@@ -2955,6 +2955,28 @@ def test_restricted_cannot_mutate_foreign(restricted_env, tool):
     assert "not found" in d["error"]
 
 
+def test_restricted_heartbeat_foreign_is_not_found(restricted_env):
+    """kanban_heartbeat must not become a liveness/enumeration oracle: a
+    restricted creator probing a foreign task id gets the same not-found
+    wording as a genuinely missing task, and cannot heartbeat it."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    out = kt._handle_heartbeat({"task_id": restricted_env["foreign"]})
+    d = json.loads(out)
+    assert d.get("error"), f"expected not-found, got {d}"
+    assert "not found" in d["error"]
+    # Own task still heartbeats — the guard lets the real owner through. Claim
+    # it first so it's in the running state a heartbeat requires (mirrors how a
+    # real worker heartbeats its own claimed task).
+    conn = kb.connect()
+    try:
+        kb.claim_task(conn, restricted_env["own"])
+    finally:
+        conn.close()
+    own = json.loads(kt._handle_heartbeat({"task_id": restricted_env["own"]}))
+    assert own.get("ok") is True, f"expected own heartbeat to succeed, got {own}"
+
+
 def test_restricted_create_rejects_foreign_parents(restricted_env, monkeypatch):
     from tools import kanban_tools as kt
     out = kt._handle_create({

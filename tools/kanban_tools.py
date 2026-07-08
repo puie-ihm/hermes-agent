@@ -836,6 +836,16 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
+        # Visibility guard: a restricted creator (e.g. front_external) probing
+        # kanban_heartbeat(<foreign_task_id>) would otherwise learn whether a
+        # privileged task is running vs unknown — a liveness/enumeration oracle.
+        # The guard returns the same not-found wording as the other handlers so
+        # a foreign id is indistinguishable from a genuinely missing one. Must
+        # run before any heartbeat mutation.
+        vguard = _visibility_guard(kb, conn, tid, "kanban_heartbeat")
+        if vguard:
+            conn.close()
+            return vguard
         try:
             # Extend the claim TTL first. The dispatcher pins
             # HERMES_KANBAN_CLAIM_LOCK in the worker env at spawn time

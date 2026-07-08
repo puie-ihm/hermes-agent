@@ -270,6 +270,78 @@ def test_branch_name_requires_worktree_workspace(kanban_home):
         )
 
 
+def test_create_task_persists_and_round_trips_origin_user(kanban_home):
+    # The verified DM UID stamped at create time must survive to get_task so
+    # the dispatcher can propagate it to the worker.
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="scoped pull", assignee="ext_data_analyst",
+            origin_user="U0AGUSN26BU",
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.origin_user == "U0AGUSN26BU"
+
+
+def test_create_task_origin_user_defaults_to_none(kanban_home):
+    # No origin (CLI/dashboard path) → NULL, not empty string.
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="unscoped", assignee="alice")
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.origin_user is None
+
+
+def test_migration_adds_origin_user_and_from_row_tolerates_legacy(tmp_path):
+    """A legacy DB lacking ``origin_user`` migrates cleanly and ``from_row``
+    yields ``None`` (not KeyError) for rows predating the column."""
+    db_path = tmp_path / "legacy-origin.db"
+    conn = sqlite3.connect(str(db_path))
+    # Minimal pre-origin_user ``tasks`` shape.
+    conn.execute("""
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT,
+            assignee TEXT,
+            status TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT,
+            claim_lock TEXT,
+            claim_expires INTEGER
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            payload TEXT,
+            created_at INTEGER NOT NULL
+        )
+    """)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) "
+        "VALUES ('legacy', 'old board task', 'ready', 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    with kb.connect(db_path) as migrated:
+        task_columns = {
+            row["name"] for row in migrated.execute("PRAGMA table_info(tasks)")
+        }
+        assert "origin_user" in task_columns
+        legacy = kb.get_task(migrated, "legacy")
+    assert legacy is not None
+    assert legacy.origin_user is None
+
+
 # ---------------------------------------------------------------------------
 # Links + dependency resolution
 # ---------------------------------------------------------------------------
@@ -3144,6 +3216,63 @@ class TestSharedBoardPaths:
         )
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
+
+    def _capture_spawn_env(self, monkeypatch, tmp_path, *, origin_user):
+        """Run ``_default_spawn`` for a task with ``origin_user`` and return
+        the env dict handed to ``subprocess.Popen``."""
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+        # The dispatcher process itself must not leak a stray value.
+        monkeypatch.delenv("HERMES_ORIGIN_USER", raising=False)
+
+        captured = {}
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["env"] = kwargs.get("env", {})
+                self.pid = 4242
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+
+        task = kb.Task(
+            id="t_origin",
+            title="x",
+            body=None,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="worktree",
+            workspace_path=str(tmp_path / "ws"),
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+            branch_name="wt/t_origin",
+            origin_user=origin_user,
+        )
+        kb._default_spawn(task, str(tmp_path / "ws"))
+        return captured["env"]
+
+    def test_dispatcher_spawn_injects_origin_user(self, tmp_path, monkeypatch):
+        # A task stamped with a verified DM UID propagates it to the worker
+        # env as HERMES_ORIGIN_USER so per-buyer scope guards can default-deny.
+        env = self._capture_spawn_env(
+            monkeypatch, tmp_path, origin_user="U0AGUSN26BU"
+        )
+        assert env["HERMES_ORIGIN_USER"] == "U0AGUSN26BU"
+
+    def test_dispatcher_spawn_omits_origin_user_when_absent(
+        self, tmp_path, monkeypatch
+    ):
+        # Non-DM tasks (CLI, dashboard, legacy) carry no origin — the worker
+        # env must not gain a stray/empty HERMES_ORIGIN_USER, which would
+        # otherwise read as "some user" to a scope guard.
+        env = self._capture_spawn_env(monkeypatch, tmp_path, origin_user=None)
+        assert "HERMES_ORIGIN_USER" not in env
 
 
 # ---------------------------------------------------------------------------

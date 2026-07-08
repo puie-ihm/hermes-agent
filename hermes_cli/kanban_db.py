@@ -908,6 +908,11 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
+    # Verified Slack UID of the end-user whose DM created this task, stamped
+    # from the trusted session context (HERMES_SESSION_USER_ID). Propagated to
+    # the worker as HERMES_ORIGIN_USER for per-buyer scope guards. NULL for
+    # tasks created outside a verified DM session (CLI, dashboard, legacy rows).
+    origin_user: Optional[str] = None
     # Typed block reason (one of VALID_BLOCK_KINDS) or None for legacy/un-typed
     # blocks. Set by ``block_task``; preserved across unblock so a re-block for
     # the same kind is recognisable as an unblock↔re-block loop.
@@ -990,6 +995,9 @@ class Task:
             ),
             session_id=(
                 row["session_id"] if "session_id" in keys else None
+            ),
+            origin_user=(
+                row["origin_user"] if "origin_user" in keys else None
             ),
             block_kind=(
                 row["block_kind"] if "block_kind" in keys and row["block_kind"] else None
@@ -1164,6 +1172,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
     session_id           TEXT,
+    -- Verified Slack UID of the end-user whose DM created this task, stamped
+    -- from the trusted session context (HERMES_SESSION_USER_ID) — NOT a tool
+    -- arg. Propagated to the worker as HERMES_ORIGIN_USER so per-buyer scope
+    -- guards (e.g. meta-ads account scoping) can default-deny. NULL for tasks
+    -- created outside a verified DM session (CLI, dashboard, legacy rows).
+    origin_user          TEXT,
     -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
     -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
     -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
@@ -1971,6 +1985,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "session_id", "session_id TEXT"
         )
 
+    if "origin_user" not in cols:
+        # Verified Slack UID of the DM end-user, stamped from the trusted
+        # session context at create time. NULL on legacy rows and on any
+        # creation path outside a verified DM session (CLI, dashboard).
+        _add_column_if_missing(
+            conn, "tasks", "origin_user", "origin_user TEXT"
+        )
+
     if "block_kind" not in cols:
         # Typed block reason (VALID_BLOCK_KINDS) or NULL for legacy/un-typed
         # blocks. Existing blocked rows get NULL, which is treated as a
@@ -2468,6 +2490,7 @@ def create_task(
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
+    origin_user: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
 ) -> str:
@@ -2698,8 +2721,9 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        origin_user
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2722,6 +2746,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        origin_user,
                     ),
                 )
                 for pid in parents:
@@ -8393,6 +8418,13 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+    # Propagate the verified DM end-user UID (stamped at create time from the
+    # trusted session context) so per-buyer scope guards in the worker — e.g.
+    # the meta-ads account-scope check — can default-deny. Non-secret; survives
+    # the terminal env sanitizer (not in _ALWAYS_STRIP_KEYS, no secret suffix).
+    # Omitted when NULL so non-DM tasks carry no origin.
+    if task.origin_user:
+        env["HERMES_ORIGIN_USER"] = task.origin_user
 
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the

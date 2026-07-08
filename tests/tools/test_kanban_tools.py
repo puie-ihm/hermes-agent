@@ -1154,6 +1154,93 @@ def test_create_session_id_absent_when_env_unset(monkeypatch, worker_env):
         conn.close()
 
 
+def test_create_stamps_origin_user_from_session(monkeypatch, worker_env):
+    """The verified DM end-user UID is stamped onto the task from the trusted
+    session context (HERMES_SESSION_USER_ID), so per-buyer scope guards in the
+    spawned worker can default-deny against a UID the caller cannot forge."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from gateway import session_context as sc
+
+    sc.set_session_vars(user_id="U0AGUSN26BU")
+    try:
+        out = kt._handle_create({
+            "title": "scoped pull",
+            "assignee": "peer",
+            "parents": [worker_env],
+        })
+    finally:
+        sc.reset_session_vars()
+    d = json.loads(out)
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        new_task = kb.get_task(conn, d["task_id"])
+        assert new_task.origin_user == "U0AGUSN26BU"
+    finally:
+        conn.close()
+
+
+def test_create_ignores_origin_user_tool_arg(monkeypatch, worker_env):
+    """Security invariant: origin_user has NO caller-controlled write path.
+    Even if a (prompt-injected) caller smuggles an ``origin_user`` field into
+    the tool args, it must be ignored — only the trusted session UID is
+    stamped, never the arg. Guards against schema drift re-opening a forge."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from gateway import session_context as sc
+
+    sc.set_session_vars(user_id="U035BS4L61Z")  # trusted (head)
+    try:
+        out = kt._handle_create({
+            "title": "forge attempt",
+            "assignee": "peer",
+            "parents": [worker_env],
+            "origin_user": "U0AGUSN26BU",  # spoofed low-scope buyer — MUST be ignored
+        })
+    finally:
+        sc.reset_session_vars()
+    d = json.loads(out)
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        new_task = kb.get_task(conn, d["task_id"])
+        # The trusted session UID wins; the smuggled arg never reaches the DB.
+        assert new_task.origin_user == "U035BS4L61Z"
+    finally:
+        conn.close()
+
+
+def test_create_origin_user_absent_without_session_user(monkeypatch, worker_env):
+    """No verified DM session (CLI/dashboard/cron) → origin_user stays NULL,
+    even if the caller supplies an ``origin_user`` arg. A missing origin must
+    never fall back to a caller-supplied value."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from gateway import session_context as sc
+
+    # Bind the session context with an empty user_id so the os.environ fallback
+    # is suppressed — this is the "no verified DM user" state.
+    sc.set_session_vars(user_id="")
+    try:
+        out = kt._handle_create({
+            "title": "cli create",
+            "assignee": "peer",
+            "parents": [worker_env],
+            "origin_user": "U0AGUSN26BU",  # supplied but must be ignored
+        })
+    finally:
+        sc.reset_session_vars()
+    d = json.loads(out)
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        new_task = kb.get_task(conn, d["task_id"])
+        assert new_task.origin_user is None
+    finally:
+        conn.close()
+
+
 def test_create_rejects_no_title(worker_env):
     from tools import kanban_tools as kt
     assert json.loads(kt._handle_create({"assignee": "x"})).get("error")

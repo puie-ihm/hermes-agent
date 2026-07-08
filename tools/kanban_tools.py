@@ -1173,6 +1173,14 @@ def _handle_create(args: dict, **kw) -> str:
     # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
     # CLI / dashboard paths and on legacy hosts that don't set the env.
     session_id = args.get("session_id") or os.environ.get("HERMES_SESSION_ID")
+    # Verified DM end-user UID, read ONLY from the trusted session context
+    # (the gateway's task-local HERMES_SESSION_USER_ID) — never from a tool
+    # arg. This is a security stamp: an injected creator must not be able to
+    # forge the origin, so there is deliberately no caller-controlled write
+    # path (no ``origin_user`` in the tool-arg schema). NULL outside a
+    # verified DM session (CLI, dashboard, cron).
+    from gateway.session_context import get_session_env
+    origin_user = get_session_env("HERMES_SESSION_USER_ID", "") or None
     priority = args.get("priority")
     # Resolve workspace. If the caller passed one explicitly, honor it.
     # Otherwise, a dispatcher-spawned worker (HERMES_KANBAN_TASK set)
@@ -1267,6 +1275,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=creator,
                 session_id=session_id,
+                origin_user=origin_user,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)

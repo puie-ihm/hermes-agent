@@ -162,6 +162,13 @@ class GatewayKanbanWatchersMixin:
         notify_artifact_uploads = bool(
             kanban_cfg.get("notify_artifact_uploads", True)
         )
+        # Whether to POST the visible completion/blocked/etc. notification text
+        # ("✔ [board] @assignee Kanban <id> done — …") into the subscriber's chat.
+        # External buyer-facing profiles (front_external) set this false so the
+        # raw internal notification never lands in the buyer DM — the wake
+        # injection below still fires, so the creator is re-invoked to relay a
+        # clean, buyer-safe answer. Default on (unchanged for every other profile).
+        notify_text = bool(kanban_cfg.get("notify_text", True))
         from gateway.config import Platform as _Platform
         try:
             from hermes_cli import kanban_db as _kb
@@ -411,6 +418,13 @@ class GatewayKanbanWatchersMixin:
                             # archive needs no user ping, and unblocked is an
                             # internal transition. They are also excluded from
                             # _WAKE_KINDS below, so they never wake the creator.
+                            continue
+                        # notify_text=false (external buyer-facing profiles):
+                        # suppress the visible notification text for this event
+                        # but fall through to the cursor advance + wake injection
+                        # in the for/else, so the creator still relays a clean
+                        # answer without the raw "✔ … Kanban … done" line leaking.
+                        if not notify_text:
                             continue
                         metadata: dict[str, Any] = {}
                         if sub.get("thread_id"):

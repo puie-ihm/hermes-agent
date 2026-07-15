@@ -2703,6 +2703,12 @@ DEFAULT_CONFIG = {
         # on-disk files a prompt-injected worker named — the text notification
         # (redacted) still fires.
         "notify_artifact_uploads": True,
+        # When true (default), the kanban notifier POSTS the visible
+        # "✔ [board] @assignee Kanban <id> done — …" text into the subscriber's
+        # chat. Set false on external buyer-facing profiles so the raw internal
+        # notification never lands in the buyer DM; the completion WAKE (which
+        # re-invokes the creator to relay a clean answer) still fires.
+        "notify_text": True,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

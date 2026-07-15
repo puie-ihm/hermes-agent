@@ -2827,7 +2827,14 @@ class SlackAdapter(BasePlatformAdapter):
         # get reaction noise on messages that don't address the bot. Only the 1:1
         # case earns the DM exemptions; session/thread scoping below still treats
         # both as DM-style persistent conversations.
-        is_one_to_one_dm = channel_type == "im"
+        # A true 1:1 IM has a D-prefixed channel id. Slack *Assistant* apps
+        # deliver messages in a shared mpim/group container (C-prefixed, e.g.
+        # `mpdm-…`) with channel_type="im" too — without the id check those would
+        # wrongly earn the 1:1 mention exemption and the bot answers every message
+        # in the group (even ones @-mentioning someone else). Require a D-prefix so
+        # only genuine 1:1 DMs are mention-exempt; group DMs/channels obey
+        # require_mention/strict_mention.
+        is_one_to_one_dm = channel_type == "im" and channel_id.startswith("D")
 
         # Build thread_ts for session keying.
         # In channels: fall back to ts so each top-level @mention starts a

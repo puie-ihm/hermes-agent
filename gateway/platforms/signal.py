@@ -1173,7 +1173,7 @@ class SignalAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send a batch of images via chunked Signal RPC calls.
 
         Per-image alt texts are dropped — Signal's send RPC only carries
@@ -1183,7 +1183,7 @@ class SignalAdapter(BasePlatformAdapter):
         the rate-limit scheduler handles inter-batch pacing.
         """
         if not images:
-            return
+            return SendResult(success=False, error="no images were provided")
 
         scheduler = get_scheduler()
         logger.info(
@@ -1225,12 +1225,13 @@ class SignalAdapter(BasePlatformAdapter):
             attachments.append(file_path)
 
         if not attachments:
-            logger.error(
-                "Signal: no valid images in batch of %d "
-                "(download=%d missing=%d oversize=%d)",
-                len(images), skipped_download, skipped_missing, skipped_oversize,
+            error = (
+                f"no valid images in batch of {len(images)} "
+                f"(download={skipped_download} missing={skipped_missing} "
+                f"oversize={skipped_oversize})"
             )
-            return
+            logger.error("Signal: %s", error)
+            return SendResult(success=False, error=error)
 
         logger.info(
             "Signal send_multiple_images: %d/%d images valid, sending in chunks",
@@ -1250,6 +1251,8 @@ class SignalAdapter(BasePlatformAdapter):
             attachments[i:i + SIGNAL_MAX_ATTACHMENTS_PER_MSG]
             for i in range(0, len(attachments), SIGNAL_MAX_ATTACHMENTS_PER_MSG)
         ]
+        successful_result: Optional[SendResult] = None
+        failed_result: Optional[SendResult] = None
 
         for idx, att_batch in enumerate(att_batches):
             n = len(att_batch)
@@ -1279,6 +1282,10 @@ class SignalAdapter(BasePlatformAdapter):
                         if success:
                             self._track_sent_timestamp(result)
                             await scheduler.report_rpc_duration(_rpc_duration, n)
+                            successful_result = SendResult(
+                                success=True,
+                                raw_response=result,
+                            )
                             logger.info(
                                 "Signal batch %d/%d: %d attachments sent in %.1fs "
                                 "(attempt %d/%d)",
@@ -1292,6 +1299,10 @@ class SignalAdapter(BasePlatformAdapter):
                                 idx + 1, len(att_batches), n,
                                 attempt, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS,
                                 _rpc_duration, err_msg,
+                            )
+                            failed_result = SendResult(
+                                success=False,
+                                error=err_msg,
                             )
                             # Retry transient (non-rate-limit) failures once
                             if attempt < SIGNAL_RATE_LIMIT_MAX_ATTEMPTS:
@@ -1310,6 +1321,10 @@ class SignalAdapter(BasePlatformAdapter):
                             idx + 1, len(att_batches), n,
                             attempt, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS,
                             _rpc_duration,
+                        )
+                        failed_result = SendResult(
+                            success=False,
+                            error="Signal RPC returned no send result",
                         )
                         # Retry transient (non-rate-limit) failures once
                         if attempt < SIGNAL_RATE_LIMIT_MAX_ATTEMPTS:
@@ -1330,6 +1345,10 @@ class SignalAdapter(BasePlatformAdapter):
                             idx + 1, len(att_batches), n,
                             f"{e.retry_after:.0f}s" if e.retry_after else "unknown",
                         )
+                        failed_result = SendResult(
+                            success=False,
+                            error="Signal rate-limit retries exhausted",
+                        )
                         break
                     logger.warning(
                         "Signal: rate-limited on batch %d/%d "
@@ -1339,6 +1358,11 @@ class SignalAdapter(BasePlatformAdapter):
                         attempt, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS,
                         f"{e.retry_after:.0f}s" if e.retry_after else "unknown",
                     )
+
+        return successful_result or failed_result or SendResult(
+            success=False,
+            error="no image batch was delivered",
+        )
 
     async def _notify_batch_pacing(
         self,

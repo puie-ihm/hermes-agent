@@ -344,8 +344,10 @@ class TestGatewaySurfacesNullResponse:
             agent_result, response, history_len=10,
         )
 
-        assert response != "", "Null response with api_calls>0 must be surfaced"
-        assert "nonexistent_tool" in response
+        assert response == (
+            "We couldn't complete the full request. Please try again."
+        )
+        assert "nonexistent_tool" not in response
 
     def test_interrupted_response_stays_empty(self):
         """Interrupted agent → response stays empty (platform handles UX)."""
@@ -381,7 +383,7 @@ class TestGatewaySurfacesNullResponse:
             agent_result, response, history_len=60,
         )
 
-        assert "context window" in response
+        assert "conversation is too long" in response.lower()
         assert "/compact" in response
 
     def test_failed_generic_error(self):
@@ -400,8 +402,34 @@ class TestGatewaySurfacesNullResponse:
             agent_result, response, history_len=5,
         )
 
-        assert "500 Internal Server Error" in response
-        assert "/reset" in response
+        assert response == (
+            "We couldn't complete your request. Please try again. "
+            "If it keeps happening, use /reset to start fresh."
+        )
+        assert "500 Internal Server Error" not in response
+
+    def test_failed_quota_and_timeout_use_fixed_business_messages(self):
+        from gateway.run import _normalize_empty_agent_response
+
+        quota = _normalize_empty_agent_response(
+            {"failed": True, "error": "429 quota exceeded for provider X"},
+            "",
+        )
+        timeout = _normalize_empty_agent_response(
+            {"failed": True, "error": "upstream deadline timeout trace=secret"},
+            "",
+        )
+
+        assert quota == (
+            "We're handling too many requests right now. "
+            "Please try again shortly."
+        )
+        assert timeout == (
+            "This request took too long and could not be completed. "
+            "Please try again."
+        )
+        assert "provider" not in quota.lower()
+        assert "trace" not in timeout.lower()
 
     def test_nonempty_response_passes_through(self):
         """Non-empty response is returned unchanged."""

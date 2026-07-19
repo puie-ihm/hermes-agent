@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any, Tuple, List
 
@@ -400,6 +401,37 @@ def _is_slack_voice_clip(file_obj: Dict[str, Any]) -> bool:
         return True
     name = (file_obj.get("name") or "").strip().lower()
     return name.startswith("audio_message")
+
+
+_SLACK_CLIENT_MSG_ID_NAMESPACE = uuid.uuid5(
+    uuid.NAMESPACE_URL,
+    "https://hermes-agent.dev/slack/client-msg-id",
+)
+
+
+def _make_client_msg_id(
+    workspace_id: str,
+    channel_id: str,
+    thread_ts: Optional[str],
+    logical_request_id: str,
+    content: str,
+    chunk_index: int,
+) -> str:
+    """Return the stable Slack UUID for one logical outbound chunk."""
+    delivery_key = json.dumps(
+        {
+            "workspace_id": workspace_id,
+            "channel_id": channel_id,
+            "logical_request_id": logical_request_id,
+            "thread_ts": thread_ts,
+            "content": content,
+            "chunk_index": chunk_index,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return str(uuid.uuid5(_SLACK_CLIENT_MSG_ID_NAMESPACE, delivery_key))
 
 
 class SlackAdapter(BasePlatformAdapter):
@@ -1365,6 +1397,28 @@ class SlackAdapter(BasePlatformAdapter):
             return self._team_clients[team_id]
         return self._app.client  # fallback to primary
 
+    async def _send_with_retry(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Any = None,
+        max_retries: int = 2,
+        base_delay: float = 2.0,
+        delivery_observer: Optional[Any] = None,
+    ) -> SendResult:
+        """Keep one fallback delivery identity across Slack retry attempts."""
+        retry_metadata = {} if metadata is None else metadata
+        return await super()._send_with_retry(
+            chat_id=chat_id,
+            content=content,
+            reply_to=reply_to,
+            metadata=retry_metadata,
+            max_retries=max_retries,
+            base_delay=base_delay,
+            delivery_observer=delivery_observer,
+        )
+
     async def send(
         self,
         chat_id: str,
@@ -1397,6 +1451,24 @@ class SlackAdapter(BasePlatformAdapter):
 
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
             last_result = None
+            workspace_id = self._channel_team.get(chat_id) or next(
+                iter(self._team_clients),
+                "",
+            )
+            metadata_dict = metadata if isinstance(metadata, dict) else None
+            request_identity = None
+            if metadata_dict is not None:
+                request_identity = (
+                    metadata_dict.get("client_message_id")
+                    or metadata_dict.get("request_id")
+                    or metadata_dict.get("_slack_client_message_id")
+                )
+            if not request_identity:
+                request_identity = str(uuid.uuid4())
+                if metadata_dict is not None:
+                    metadata_dict["_slack_client_message_id"] = request_identity
+            logical_request_id = str(request_identity)
+            client = self._get_client(chat_id)
 
             # reply_broadcast: also post thread replies to the main channel.
             # Controlled via platform config: gateway.slack.reply_broadcast
@@ -1414,6 +1486,14 @@ class SlackAdapter(BasePlatformAdapter):
                     "channel": chat_id,
                     "text": chunk,
                     "mrkdwn": True,
+                    "client_msg_id": _make_client_msg_id(
+                        workspace_id,
+                        chat_id,
+                        thread_ts,
+                        logical_request_id,
+                        content,
+                        i,
+                    ),
                 }
                 if blocks and i == 0:
                     kwargs["blocks"] = blocks
@@ -1423,7 +1503,7 @@ class SlackAdapter(BasePlatformAdapter):
                     if broadcast and i == 0:
                         kwargs["reply_broadcast"] = True
 
-                last_result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+                last_result = await client.chat_postMessage(**kwargs)
 
             # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
@@ -1729,7 +1809,7 @@ class SlackAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send a batch of images as a single Slack message with multiple file uploads.
 
         Uses ``files_upload_v2`` with its ``file_uploads`` parameter so all
@@ -1740,22 +1820,28 @@ class SlackAdapter(BasePlatformAdapter):
         The batch limit is 10 file uploads per call (Slack server-side cap).
         """
         if not self._app:
-            return
+            return SendResult(success=False, error="Slack adapter is not connected")
         if not images:
-            return
+            return SendResult(success=False, error="no images were provided")
 
         try:
             import httpx as _httpx
             from urllib.parse import unquote as _unquote
             from tools.url_safety import is_safe_url as _is_safe_url
         except Exception:
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
-            return
+            return await super().send_multiple_images(
+                chat_id,
+                images,
+                metadata,
+                human_delay,
+            )
 
         thread_ts = self._resolve_thread_ts(None, metadata)
 
         CHUNK = 10
         chunks = [images[i : i + CHUNK] for i in range(0, len(images), CHUNK)]
+        successful_result: Optional[SendResult] = None
+        failed_result: Optional[SendResult] = None
 
         for chunk_idx, chunk in enumerate(chunks):
             if human_delay > 0 and chunk_idx > 0:
@@ -1816,6 +1902,10 @@ class SlackAdapter(BasePlatformAdapter):
                                 continue
 
                 if not file_uploads:
+                    failed_result = SendResult(
+                        success=False,
+                        error="no valid images were available for upload",
+                    )
                     continue
 
                 initial_comment = (
@@ -1834,7 +1924,7 @@ class SlackAdapter(BasePlatformAdapter):
                     thread_ts=thread_ts,
                 )
                 self._record_uploaded_file_thread(chat_id, thread_ts)
-                _ = result
+                successful_result = SendResult(success=True, raw_response=result)
             except Exception as e:
                 logger.warning(
                     "[Slack] Multi-image files_upload_v2 failed (chunk %d/%d), falling back to per-image: %s",
@@ -1843,9 +1933,20 @@ class SlackAdapter(BasePlatformAdapter):
                     e,
                     exc_info=True,
                 )
-                await super().send_multiple_images(
-                    chat_id, chunk, metadata, human_delay=human_delay
+                fallback_result = await super().send_multiple_images(
+                    chat_id,
+                    chunk,
+                    metadata,
+                    human_delay=human_delay,
                 )
+                if fallback_result.success:
+                    successful_result = fallback_result
+                else:
+                    failed_result = fallback_result
+        return successful_result or failed_result or SendResult(
+            success=False,
+            error="no images were delivered",
+        )
 
     def _record_uploaded_file_thread(
         self, chat_id: str, thread_ts: Optional[str]

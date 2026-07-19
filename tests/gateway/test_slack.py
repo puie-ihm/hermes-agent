@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import os
 import sys
+from uuid import UUID
 from unittest.mock import AsyncMock, MagicMock, patch, call
 
 import pytest
@@ -3233,6 +3234,127 @@ class TestMessageSplitting:
         await adapter.send("C123", long_text)
         # Should have been called multiple times
         assert adapter._app.client.chat_postMessage.call_count >= 2
+        client_msg_ids = [
+            posted.kwargs["client_msg_id"]
+            for posted in adapter._app.client.chat_postMessage.await_args_list
+        ]
+        assert len(client_msg_ids) == len(set(client_msg_ids))
+        assert all(str(UUID(value)) == value for value in client_msg_ids)
+
+    @pytest.mark.asyncio
+    async def test_client_msg_id_is_stable_for_logical_retry(self, adapter):
+        adapter._channel_team["C123"] = "T_WORKSPACE"
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
+        metadata = {"thread_id": "thread-1", "request_id": "request-1"}
+
+        await adapter.send("C123", "same response", metadata=metadata)
+        await adapter.send("C123", "same response", metadata=metadata)
+
+        first, retry = adapter._app.client.chat_postMessage.await_args_list
+        assert first.kwargs["client_msg_id"] == retry.kwargs["client_msg_id"]
+
+    @pytest.mark.asyncio
+    async def test_client_msg_id_changes_for_distinct_requests(self, adapter):
+        adapter._channel_team["C123"] = "T_WORKSPACE"
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
+
+        await adapter.send(
+            "C123",
+            "same response",
+            metadata={"thread_id": "thread-1", "request_id": "request-1"},
+        )
+        await adapter.send(
+            "C123",
+            "same response",
+            metadata={"thread_id": "thread-1", "request_id": "request-2"},
+        )
+
+        first, second = adapter._app.client.chat_postMessage.await_args_list
+        assert first.kwargs["client_msg_id"] != second.kwargs["client_msg_id"]
+
+    @pytest.mark.asyncio
+    async def test_client_msg_id_changes_between_unidentified_send_calls(self, adapter):
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
+
+        await adapter.send("C123", "same response")
+        await adapter.send("C123", "same response")
+
+        first, second = adapter._app.client.chat_postMessage.await_args_list
+        assert first.kwargs["client_msg_id"] != second.kwargs["client_msg_id"]
+
+    @pytest.mark.asyncio
+    async def test_client_msg_id_reuses_generated_identity_across_gateway_retry(
+        self, adapter, monkeypatch
+    ):
+        adapter._app.client.chat_postMessage = AsyncMock(
+            side_effect=[ConnectionError("ConnectionError"), {"ts": "ts1"}]
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base.random.uniform",
+            lambda *_args: 0,
+        )
+
+        result = await adapter._send_with_retry(
+            "C123",
+            "same response",
+            max_retries=1,
+            base_delay=0,
+        )
+
+        assert result.success
+        first, retry = adapter._app.client.chat_postMessage.await_args_list
+        assert first.kwargs["client_msg_id"] == retry.kwargs["client_msg_id"]
+
+    @pytest.mark.asyncio
+    async def test_client_msg_id_changes_with_delivery_inputs(self, adapter):
+        adapter._channel_team["C123"] = "T_WORKSPACE"
+        adapter._channel_team["C999"] = "T_WORKSPACE"
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
+
+        await adapter.send(
+            "C123",
+            "# Title",
+            metadata={"thread_id": "thread-1", "request_id": "request-1"},
+        )
+        await adapter.send(
+            "C123",
+            "**Title**",
+            metadata={"thread_id": "thread-1", "request_id": "request-1"},
+        )
+        await adapter.send(
+            "C123",
+            "# Title",
+            metadata={"thread_id": "thread-2", "request_id": "request-1"},
+        )
+        await adapter.send(
+            "C999",
+            "# Title",
+            metadata={"thread_id": "thread-1", "request_id": "request-1"},
+        )
+        adapter._channel_team["C123"] = "T_OTHER_WORKSPACE"
+        await adapter.send(
+            "C123",
+            "# Title",
+            metadata={"thread_id": "thread-1", "request_id": "request-1"},
+        )
+
+        (
+            first,
+            different_content,
+            different_thread,
+            different_channel,
+            different_workspace,
+        ) = adapter._app.client.chat_postMessage.await_args_list
+        assert first.kwargs["text"] == different_content.kwargs["text"]
+        assert len(
+            {
+                first.kwargs["client_msg_id"],
+                different_content.kwargs["client_msg_id"],
+                different_thread.kwargs["client_msg_id"],
+                different_channel.kwargs["client_msg_id"],
+                different_workspace.kwargs["client_msg_id"],
+            }
+        ) == 5
 
     @pytest.mark.asyncio
     async def test_short_message_single_send(self, adapter):

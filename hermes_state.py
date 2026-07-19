@@ -787,6 +787,34 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+
+CREATE TABLE IF NOT EXISTS gateway_requests (
+    request_id TEXT PRIMARY KEY,
+    platform TEXT NOT NULL DEFAULT '',
+    session_key TEXT NOT NULL DEFAULT '',
+    user_id TEXT,
+    chat_id TEXT NOT NULL DEFAULT '',
+    thread_id TEXT,
+    platform_message_id TEXT,
+    client_message_id TEXT,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'RECEIVED',
+    delivery_state TEXT NOT NULL DEFAULT 'NONE',
+    received_at REAL NOT NULL DEFAULT 0,
+    queued_at REAL,
+    admitted_at REAL,
+    started_at REAL,
+    finalized_at REAL,
+    delivery_started_at REAL,
+    delivered_at REAL,
+    updated_at REAL NOT NULL DEFAULT 0,
+    response_hash TEXT,
+    delivery_message_id TEXT,
+    public_error TEXT,
+    CHECK (status IN ('RECEIVED', 'QUEUED', 'WORKING', 'FINAL', 'PARTIAL', 'FAILED')),
+    CHECK (delivery_state IN ('NONE', 'SENDING', 'DELIVERED', 'FAILED'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -810,6 +838,11 @@ CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
     ON sessions(source, user_id, chat_id, chat_type, thread_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
     ON sessions(handoff_state, started_at);
+CREATE INDEX IF NOT EXISTS idx_gateway_requests_status_received
+    ON gateway_requests(status, received_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gateway_requests_inbound_identity
+    ON gateway_requests(platform, chat_id, platform_message_id)
+    WHERE platform_message_id IS NOT NULL AND platform_message_id <> '';
 """
 
 FTS_SQL = """
@@ -866,6 +899,15 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON message
     );
 END;
 """
+
+
+GATEWAY_REQUEST_STATUSES = frozenset(
+    {"RECEIVED", "QUEUED", "WORKING", "FINAL", "PARTIAL", "FAILED"}
+)
+GATEWAY_REQUEST_TERMINAL_STATUSES = frozenset({"FINAL", "PARTIAL", "FAILED"})
+GATEWAY_REQUEST_DELIVERY_STATES = frozenset(
+    {"NONE", "SENDING", "DELIVERED", "FAILED"}
+)
 
 
 class SessionDB:
@@ -1731,6 +1773,300 @@ class SessionDB:
             )
 
         self._execute_write(_do)
+
+    # ── Durable gateway request lifecycle ─────────────────────────────
+
+    @staticmethod
+    def _validate_gateway_request_status(status: str) -> str:
+        if not isinstance(status, str) or status not in GATEWAY_REQUEST_STATUSES:
+            allowed = ", ".join(sorted(GATEWAY_REQUEST_STATUSES))
+            raise ValueError(f"invalid gateway request status {status!r}; expected one of: {allowed}")
+        return status
+
+    @staticmethod
+    def _validate_gateway_delivery_state(delivery_state: str) -> str:
+        if (
+            not isinstance(delivery_state, str)
+            or delivery_state not in GATEWAY_REQUEST_DELIVERY_STATES
+        ):
+            allowed = ", ".join(sorted(GATEWAY_REQUEST_DELIVERY_STATES))
+            raise ValueError(
+                f"invalid gateway request delivery state {delivery_state!r}; "
+                f"expected one of: {allowed}"
+            )
+        return delivery_state
+
+    @staticmethod
+    def _require_gateway_request_text(name: str, value: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name} must be a non-empty string")
+        return value
+
+    def create_or_get_gateway_request(
+        self,
+        *,
+        request_id: str,
+        platform: str,
+        session_key: str,
+        user_id: Optional[str],
+        chat_id: str,
+        thread_id: Optional[str] = None,
+        platform_message_id: Optional[str] = None,
+        client_message_id: Optional[str] = None,
+        payload_json: Optional[str] = None,
+        received_at: Optional[float] = None,
+    ) -> Tuple[Dict[str, Any], bool]:
+        """Atomically insert an inbound request or return its existing ledger row.
+
+        A non-empty platform message ID is idempotent within its platform and
+        chat. Empty or absent platform message IDs deliberately do not
+        deduplicate, leaving ``request_id`` as the only identity.
+        """
+        request_id = self._require_gateway_request_text("request_id", request_id)
+        platform = self._require_gateway_request_text("platform", platform)
+        session_key = self._require_gateway_request_text("session_key", session_key)
+        chat_id = self._require_gateway_request_text("chat_id", chat_id)
+        if payload_json is None:
+            payload_json = "{}"
+        if not isinstance(payload_json, str):
+            raise ValueError("payload_json must be a JSON string")
+        try:
+            json.loads(payload_json)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("payload_json must contain valid JSON") from exc
+        if platform_message_id is not None and not isinstance(platform_message_id, str):
+            raise ValueError("platform_message_id must be a string or None")
+        now = time.time() if received_at is None else float(received_at)
+
+        def _do(conn):
+            cursor = conn.execute(
+                """
+                INSERT INTO gateway_requests (
+                    request_id, platform, session_key, user_id, chat_id,
+                    thread_id, platform_message_id, client_message_id,
+                    payload_json, status, delivery_state, received_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'RECEIVED', 'NONE', ?, ?)
+                ON CONFLICT DO NOTHING
+                """,
+                (
+                    request_id,
+                    platform,
+                    session_key,
+                    user_id,
+                    chat_id,
+                    thread_id,
+                    platform_message_id,
+                    client_message_id,
+                    payload_json,
+                    now,
+                    now,
+                ),
+            )
+            created = cursor.rowcount == 1
+            row = conn.execute(
+                "SELECT * FROM gateway_requests WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if row is None and platform_message_id:
+                row = conn.execute(
+                    """
+                    SELECT * FROM gateway_requests
+                    WHERE platform = ? AND chat_id = ? AND platform_message_id = ?
+                    """,
+                    (platform, chat_id, platform_message_id),
+                ).fetchone()
+            if row is None:
+                raise RuntimeError("gateway request insert did not produce a readable row")
+            return dict(row), created
+
+        return self._execute_write(_do)
+
+    def compare_and_set_gateway_request_status(
+        self,
+        request_id: str,
+        *,
+        from_statuses: List[str],
+        to_status: str,
+        response_hash: Optional[str] = None,
+        public_error: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically transition a request from one of the caller's source states.
+
+        Terminal lifecycle rows are immutable regardless of ``from_statuses``.
+        The returned row is the committed shape on success; ``None`` means the
+        request was absent, in the wrong source state, or already terminal.
+        """
+        request_id = self._require_gateway_request_text("request_id", request_id)
+        to_status = self._validate_gateway_request_status(to_status)
+        if isinstance(from_statuses, str) or not from_statuses:
+            raise ValueError("from_statuses must contain at least one status")
+        source_statuses = tuple(
+            dict.fromkeys(self._validate_gateway_request_status(s) for s in from_statuses)
+        )
+        if to_status not in GATEWAY_REQUEST_TERMINAL_STATUSES and (
+            response_hash is not None or public_error is not None
+        ):
+            raise ValueError("response_hash and public_error require a terminal status")
+        changed_at = time.time() if now is None else float(now)
+        assignments = ["status = ?", "updated_at = ?"]
+        params: List[Any] = [to_status, changed_at]
+        if to_status == "QUEUED":
+            assignments.append("queued_at = COALESCE(queued_at, ?)")
+            params.append(changed_at)
+        elif to_status == "WORKING":
+            assignments.extend(
+                [
+                    "admitted_at = COALESCE(admitted_at, ?)",
+                    "started_at = COALESCE(started_at, ?)",
+                ]
+            )
+            params.extend([changed_at, changed_at])
+        elif to_status in GATEWAY_REQUEST_TERMINAL_STATUSES:
+            assignments.extend(
+                [
+                    "finalized_at = COALESCE(finalized_at, ?)",
+                    "response_hash = ?",
+                    "public_error = ?",
+                ]
+            )
+            params.extend([changed_at, response_hash, public_error])
+        placeholders = ", ".join("?" for _ in source_statuses)
+        params.extend([request_id, *source_statuses])
+
+        def _do(conn):
+            cursor = conn.execute(
+                f"""
+                UPDATE gateway_requests
+                SET {", ".join(assignments)}
+                WHERE request_id = ?
+                  AND status IN ({placeholders})
+                  AND status NOT IN ('FINAL', 'PARTIAL', 'FAILED')
+                """,
+                params,
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = conn.execute(
+                "SELECT * FROM gateway_requests WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            return dict(row)
+
+        return self._execute_write(_do)
+
+    def claim_gateway_request_delivery(
+        self,
+        request_id: str,
+        *,
+        now: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Claim delivery from NONE or FAILED; only one concurrent caller wins."""
+        request_id = self._require_gateway_request_text("request_id", request_id)
+        claimed_at = time.time() if now is None else float(now)
+
+        def _do(conn):
+            cursor = conn.execute(
+                """
+                UPDATE gateway_requests
+                SET delivery_state = 'SENDING',
+                    delivery_started_at = ?,
+                    delivery_message_id = NULL,
+                    updated_at = ?
+                WHERE request_id = ? AND delivery_state IN ('NONE', 'FAILED')
+                """,
+                (claimed_at, claimed_at, request_id),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = conn.execute(
+                "SELECT * FROM gateway_requests WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            return dict(row)
+
+        return self._execute_write(_do)
+
+    def finish_gateway_request_delivery(
+        self,
+        request_id: str,
+        *,
+        delivery_state: str,
+        delivery_message_id: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Finish a claimed delivery as DELIVERED or FAILED."""
+        request_id = self._require_gateway_request_text("request_id", request_id)
+        delivery_state = self._validate_gateway_delivery_state(delivery_state)
+        if delivery_state not in {"DELIVERED", "FAILED"}:
+            raise ValueError("delivery_state must be DELIVERED or FAILED")
+        finished_at = time.time() if now is None else float(now)
+
+        def _do(conn):
+            cursor = conn.execute(
+                """
+                UPDATE gateway_requests
+                SET delivery_state = ?,
+                    delivered_at = CASE WHEN ? = 'DELIVERED' THEN ? ELSE NULL END,
+                    delivery_message_id = ?,
+                    updated_at = ?
+                WHERE request_id = ? AND delivery_state = 'SENDING'
+                """,
+                (
+                    delivery_state,
+                    delivery_state,
+                    finished_at,
+                    delivery_message_id,
+                    finished_at,
+                    request_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = conn.execute(
+                "SELECT * FROM gateway_requests WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            return dict(row)
+
+        return self._execute_write(_do)
+
+    def get_gateway_request(self, request_id: str) -> Optional[Dict[str, Any]]:
+        request_id = self._require_gateway_request_text("request_id", request_id)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM gateway_requests WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_gateway_requests(
+        self,
+        statuses: List[str],
+        *,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """List requests in the requested lifecycle states, oldest first."""
+        if isinstance(statuses, str) or not statuses:
+            raise ValueError("statuses must contain at least one status")
+        normalized = tuple(
+            dict.fromkeys(self._validate_gateway_request_status(s) for s in statuses)
+        )
+        if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0):
+            raise ValueError("limit must be a positive integer or None")
+        placeholders = ", ".join("?" for _ in normalized)
+        query = (
+            "SELECT * FROM gateway_requests "
+            f"WHERE status IN ({placeholders}) "
+            "ORDER BY received_at ASC, request_id ASC"
+        )
+        params: List[Any] = list(normalized)
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
 
     # ── Gateway routing index (replaces sessions.json, #9006 follow-up) ────
 

@@ -27,6 +27,7 @@ except ModuleNotFoundError:
 import asyncio
 import concurrent.futures
 import dataclasses
+import hashlib
 import inspect
 import json
 import logging
@@ -40,6 +41,7 @@ import tempfile
 import threading
 import time
 import sqlite3
+import uuid
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -1756,6 +1758,7 @@ from gateway.delivery import DeliveryRouter, looks_like_telegram_private_chat_id
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
+from gateway.admission import AdmissionLane, AdmissionScheduler, QueueFullError
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
@@ -2604,21 +2607,42 @@ def _normalize_empty_agent_response(
         return response
 
     if agent_result.get("failed"):
-        error_detail = agent_result.get("error", "unknown error")
-        error_str = str(error_detail).lower()
+        error_str = str(agent_result.get("error") or "").lower()
+        if any(
+            marker in error_str
+            for marker in ("429", "quota", "rate limit", "too many requests")
+        ):
+            return (
+                "We're handling too many requests right now. "
+                "Please try again shortly."
+            )
+        if any(
+            marker in error_str
+            for marker in ("timeout", "timed out", "deadline")
+        ):
+            return (
+                "This request took too long and could not be completed. "
+                "Please try again."
+            )
         is_context_failure = any(
-            p in error_str
-            for p in ("context", "token", "too large", "too long", "exceed", "payload")
+            marker in error_str
+            for marker in (
+                "context",
+                "token",
+                "too large",
+                "too long",
+                "exceed",
+                "payload",
+            )
         ) or ("400" in error_str and history_len > 50)
         if is_context_failure:
             return (
-                "⚠️ Session too large for the model's context window.\n"
-                "Use /compact to compress the conversation, or "
-                "/reset to start fresh."
+                "This conversation is too long to continue.\n"
+                "Use /compact to shorten it, or /reset to start fresh."
             )
         return (
-            f"The request failed: {str(error_detail)[:300]}\n"
-            "Try again or use /reset to start a fresh session."
+            "We couldn't complete your request. Please try again. "
+            "If it keeps happening, use /reset to start fresh."
         )
 
     api_calls = int(agent_result.get("api_calls", 0) or 0)
@@ -2633,17 +2657,19 @@ def _normalize_empty_agent_response(
         # silence there swallows a real user message, so surface it.
         if api_calls == 0:
             return (
-                "⚠️ Your message was interrupted before processing started "
-                "(likely by a recent /stop). Please send it again."
+                "Your message was interrupted before it could be handled. "
+                "Please send it again."
             )
         return response
     if api_calls > 0:
         if agent_result.get("partial"):
-            err = agent_result.get("error", "processing incomplete")
-            return f"⚠️ Processing stopped: {str(err)[:200]}. Try again."
+            return (
+                "We couldn't complete the full request. "
+                "Please try again."
+            )
         return (
-            "⚠️ Processing completed but no response was generated. "
-            "This may be a transient error — try sending your message again."
+            "We couldn't complete your request. "
+            "Please try again."
         )
 
     # api_calls == 0, not failed, not interrupted: the agent never ran for
@@ -2658,8 +2684,8 @@ def _normalize_empty_agent_response(
         and not agent_result.get("partial")
     ):
         return (
-            "⚠️ Your message wasn't processed (the previous turn was still "
-            "being cleaned up). Please send it again."
+            "Your message could not be handled because the previous request "
+            "was still finishing. Please send it again."
         )
 
     return response
@@ -2771,6 +2797,65 @@ async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None
         )
 
 
+_GATEWAY_QUEUE_FULL_MESSAGE = (
+    "I’m handling too many requests right now. Please try again shortly."
+)
+_GATEWAY_RESTART_MESSAGE = (
+    "This request could not be completed because the service restarted. "
+    "Please send it again."
+)
+_GATEWAY_REQUEST_FAILED_MESSAGE = (
+    "I couldn’t complete your request. Please try again."
+)
+_GATEWAY_DELIVERY_FAILED_MESSAGE = (
+    "I couldn’t deliver the response. Please try again."
+)
+_GATEWAY_REQUEST_NAMESPACE = uuid.UUID("d9cb8960-35d7-4dc4-9e2a-a95f16fb9266")
+_GATEWAY_SHORT_UTTERANCES = frozenset(
+    {
+        "hi",
+        "hello",
+        "hey",
+        "hiya",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "thanks",
+        "thank you",
+        "thank you very much",
+        "thx",
+        "ok",
+        "okay",
+        "got it",
+        "understood",
+        "sounds good",
+        "yes",
+        "no",
+        "yep",
+        "nope",
+        "ping",
+        "status",
+        "help",
+        "who are you",
+        "what can you do",
+    }
+)
+
+
+def _gateway_request_lane(text: str) -> AdmissionLane:
+    """Classify only deterministic conversational/control utterances as short."""
+    normalized = re.sub(r"[.!?]+$", "", str(text or "").strip().lower()).strip()
+    if normalized.startswith("/"):
+        return AdmissionLane.SHORT
+    if normalized in _GATEWAY_SHORT_UTTERANCES:
+        return AdmissionLane.SHORT
+    return AdmissionLane.HEAVY
+
+
+def _gateway_response_hash(response: str) -> str:
+    return hashlib.sha256(str(response).encode("utf-8")).hexdigest()
+
+
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
@@ -2852,6 +2937,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(
                 key, max_active_age=_bg_max_age_seconds,
             ),
+        )
+        self._admission_scheduler = AdmissionScheduler(
+            heavy_capacity=2,
+            short_capacity=2,
+            queue_capacity=10,
         )
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
@@ -4352,6 +4442,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Append a /queue event to the FIFO chain for a session."""
         if adapter is None:
             return
+        if queued_event.metadata.get("_gateway_ledger_enabled"):
+            queued_event.metadata["_gateway_continuation"] = True
         pending_slot = getattr(adapter, "_pending_messages", None)
         if pending_slot is None:
             return
@@ -5188,13 +5280,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
-            if self._queue_during_drain_enabled():
-                self._queue_or_replace_pending_event(session_key, event)
+            queued_during_drain = self._queue_during_drain_enabled()
+            if queued_during_drain:
+                db = getattr(self.session_store, "_db", None)
+                request_id = str(event.metadata.get("request_id") or "")
+                if db is not None and request_id:
+                    db.compare_and_set_gateway_request_status(
+                        request_id,
+                        from_statuses=["RECEIVED", "QUEUED", "WORKING"],
+                        to_status="QUEUED",
+                    )
+                lease = event.metadata.pop("_gateway_admission_lease", None)
+                event.metadata["_gateway_admitted"] = False
+                if lease is not None:
+                    await lease.release()
                 message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
             else:
                 message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
 
-            await adapter._send_with_retry(
+            delivery_result = await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
                 content=message,
                 reply_to=(
@@ -5206,6 +5310,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ),
                 metadata=thread_meta,
             )
+            if not queued_during_drain:
+                await self._finish_inline_gateway_request(
+                    event,
+                    response=message,
+                    delivery_result=delivery_result,
+                )
             return True
 
         # --- Approval response routing (#46866) ---
@@ -5265,16 +5375,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         session_key, _verb, _normalized_args,
                     )
                     _adapter = self._adapter_for_source(event.source)
+                    _text = ""
+                    _delivery_result = None
                     if _adapter and _reply:
                         _text, _eph_ttl = _adapter._unwrap_ephemeral(_reply)
                         if _text:
                             _anchor = self._reply_anchor_for_event(event)
-                            await _adapter._send_with_retry(
+                            _delivery_result = await _adapter._send_with_retry(
                                 chat_id=event.source.chat_id,
                                 content=_text,
                                 reply_to=_anchor,
                                 metadata=self._thread_metadata_for_source(event.source, _anchor),
                             )
+                    await self._finish_inline_gateway_request(
+                        event,
+                        response=_text,
+                        delivery_result=_delivery_result,
+                    )
                     return True
         except Exception:
             logger.warning(
@@ -5365,6 +5482,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not steered:
                 # Fall back to queue (merge into pending messages, no interrupt)
                 effective_mode = "queue"
+            else:
+                await self._finish_inline_gateway_request(event)
 
         # Store the message so it's processed as the next turn after the
         # current run finishes (or is interrupted).  Skip this for a
@@ -6414,6 +6533,185 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._startup_restore_in_progress = False
         if drained:
             logger.info("Drained %d inbound message(s) queued during startup restore", drained)
+    async def _deliver_reconciled_gateway_failure(self, row: dict) -> None:
+        """Send one fixed restart notice when a terminal recovery row is routable."""
+        db = getattr(getattr(self, "session_store", None), "_db", None)
+        if db is None:
+            return
+        request_id = str(row.get("request_id") or "")
+        try:
+            payload = json.loads(row.get("payload_json") or "{}")
+            source_payload = payload.get("source")
+            if payload.get("version") != 1 or not isinstance(source_payload, dict):
+                return
+            platform_name = str(source_payload.get("platform") or "")
+            chat_id = str(source_payload.get("chat_id") or "")
+            if (
+                not request_id
+                or not chat_id
+                or platform_name != str(row.get("platform") or "")
+                or chat_id != str(row.get("chat_id") or "")
+            ):
+                return
+            source = SessionSource(
+                platform=Platform(platform_name),
+                chat_id=chat_id,
+                chat_type=str(source_payload.get("chat_type") or "dm"),
+                user_id=source_payload.get("user_id"),
+                user_name=source_payload.get("user_name"),
+                thread_id=source_payload.get("thread_id"),
+                profile=source_payload.get("profile"),
+            )
+            adapter = self._adapter_for_source(source)
+            if adapter is None:
+                return
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return
+
+        if str(row.get("delivery_state") or "") == "SENDING":
+            db.finish_gateway_request_delivery(
+                request_id,
+                delivery_state="FAILED",
+            )
+        if db.claim_gateway_request_delivery(request_id) is None:
+            return
+        try:
+            result = await adapter.send(
+                chat_id,
+                _GATEWAY_RESTART_MESSAGE,
+                metadata=self._thread_metadata_for_source(source),
+            )
+            if getattr(result, "success", False):
+                db.finish_gateway_request_delivery(
+                    request_id,
+                    delivery_state="DELIVERED",
+                    delivery_message_id=(
+                        str(result.message_id)
+                        if getattr(result, "message_id", None) is not None
+                        else None
+                    ),
+                )
+            else:
+                db.finish_gateway_request_delivery(
+                    request_id,
+                    delivery_state="FAILED",
+                )
+        except Exception:
+            logger.warning(
+                "Could not deliver a gateway restart notice for request %s",
+                request_id,
+            )
+            db.finish_gateway_request_delivery(
+                request_id,
+                delivery_state="FAILED",
+            )
+
+    async def _reconcile_gateway_requests(self, *, limit: int = 100) -> set[str]:
+        """Fail stale work, replay safe queued rows, and return failed sessions."""
+        db = getattr(self.session_store, "_db", None)
+        if db is None:
+            return set()
+        failed_session_keys: set[str] = set()
+
+        for row in db.list_gateway_requests(["WORKING"], limit=limit):
+            failed_row = db.compare_and_set_gateway_request_status(
+                str(row["request_id"]),
+                from_statuses=["WORKING"],
+                to_status="FAILED",
+                public_error=_GATEWAY_RESTART_MESSAGE,
+            )
+            if failed_row is not None:
+                failed_session_keys.add(str(failed_row.get("session_key") or ""))
+                await self._deliver_reconciled_gateway_failure(failed_row)
+
+        replayed = getattr(self, "_gateway_replayed_request_ids", None)
+        if replayed is None:
+            replayed = set()
+            self._gateway_replayed_request_ids = replayed
+        for row in db.list_gateway_requests(["RECEIVED", "QUEUED"], limit=limit):
+            request_id = str(row["request_id"])
+            if request_id in replayed:
+                continue
+            try:
+                payload = json.loads(row.get("payload_json") or "{}")
+                source_payload = payload["source"]
+                if (
+                    payload.get("version") != 1
+                    or payload.get("replayable") is not True
+                    or not isinstance(payload.get("text"), str)
+                    or not isinstance(source_payload, dict)
+                ):
+                    raise ValueError("queued payload is not safely replayable")
+                platform_name = str(source_payload.get("platform") or "")
+                if platform_name != str(row.get("platform") or ""):
+                    raise ValueError("queued payload platform does not match")
+                platform = Platform(platform_name)
+                source = SessionSource(
+                    platform=platform,
+                    chat_id=str(source_payload.get("chat_id") or ""),
+                    chat_type=str(source_payload.get("chat_type") or "dm"),
+                    user_id=source_payload.get("user_id"),
+                    user_name=source_payload.get("user_name"),
+                    thread_id=source_payload.get("thread_id"),
+                    profile=source_payload.get("profile"),
+                )
+                if not source.chat_id:
+                    raise ValueError("queued payload has no destination")
+                adapter = self._adapter_for_source(source)
+                if adapter is None:
+                    raise ValueError("queued destination is unavailable")
+                message_type = MessageType(
+                    str(payload.get("message_type") or MessageType.TEXT.value)
+                )
+                event = MessageEvent(
+                    text=payload["text"],
+                    message_type=message_type,
+                    source=source,
+                    message_id=payload.get("message_id"),
+                    internal=True,
+                    metadata={
+                        "request_id": request_id,
+                        "client_message_id": (
+                            row.get("client_message_id") or request_id
+                        ),
+                        "_gateway_ledger_replay": True,
+                    },
+                )
+                self.session_store.clear_resume_pending(
+                    str(row.get("session_key") or "")
+                )
+                setattr(event, "_hermes_startup_restore_replay", True)
+                replayed.add(request_id)
+                await adapter.handle_message(event)
+            except Exception:
+                logger.warning(
+                    "Could not safely replay queued gateway request %s",
+                    request_id,
+                    exc_info=True,
+                )
+                failed_row = db.compare_and_set_gateway_request_status(
+                    request_id,
+                    from_statuses=["RECEIVED", "QUEUED"],
+                    to_status="FAILED",
+                    public_error=_GATEWAY_RESTART_MESSAGE,
+                )
+                if failed_row is not None:
+                    failed_session_keys.add(
+                        str(failed_row.get("session_key") or "")
+                    )
+                    await self._deliver_reconciled_gateway_failure(failed_row)
+        failed_session_keys.discard("")
+        for session_key in failed_session_keys:
+            self.session_store.clear_resume_pending(session_key)
+        blocked = getattr(
+            self,
+            "_gateway_failed_resume_session_keys",
+            set(),
+        )
+        blocked.update(failed_session_keys)
+        self._gateway_failed_resume_session_keys = blocked
+        return failed_session_keys
+
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
@@ -6438,6 +6736,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         agent is already running are skipped regardless, so a session
         scheduled at startup is never resumed a second time.
         """
+        blocked_session_keys = getattr(
+            self,
+            "_gateway_failed_resume_session_keys",
+            set(),
+        )
         window = _auto_continue_freshness_window()
         try:
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
@@ -6448,6 +6751,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and not entry.suspended
                     and entry.origin is not None
                     and entry.resume_reason in self._AUTO_RESUME_REASONS
+                    and entry.session_key not in blocked_session_keys
                     and (platform is None or entry.origin.platform == platform)
                 ]
         except Exception as exc:
@@ -7188,11 +7492,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             finally:
                 _clear_planned_restart_notification()
 
-        # Automatically continue fresh sessions that were interrupted by the
-        # previous gateway restart/shutdown.  The resume_pending flag is cleared
-        # by the normal successful-turn path, so a failed auto-resume remains
-        # visible for manual recovery on the next user message.
+        # Reconcile durable requests before legacy session auto-resume. Sessions
+        # whose in-flight request was terminalized must not also synthesize a
+        # resumed answer on this boot or a later adapter reconnect.
+        await self._reconcile_gateway_requests()
         self._schedule_resume_pending_sessions()
+        await asyncio.sleep(0)
         await self._finish_startup_restore()
 
         # Drain any recovered process watchers (from crash recovery checkpoint)
@@ -7976,6 +8281,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             self._running = False
             self._draining = True
+            scheduler = getattr(self, "_admission_scheduler", None)
+            cancelled_waiters = (
+                await scheduler.cancel_waiters() if scheduler is not None else 0
+            )
+            if cancelled_waiters:
+                logger.info(
+                    "Shutdown cancelled %d queued gateway request(s)",
+                    cancelled_waiters,
+                )
 
             # Notify all chats with active agents BEFORE draining.
             # Adapters are still connected here, so messages can be sent.
@@ -8451,7 +8765,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Stamp every inbound event from this adapter with its profile so
             # the agent turn (and session key) resolve to the right home.
             adapter.set_message_handler(
-                self._make_profile_message_handler(profile_name)
+                self._make_profile_message_handler(profile_name),
+                prepare_handler=self._make_profile_request_prepare_handler(
+                    profile_name
+                ),
             )
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
@@ -8485,6 +8802,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
             return await self._handle_message(event)
         return _handler
+    def _make_profile_request_prepare_handler(self, profile_name: str):
+        """Stamp source.profile before durable request identity is prepared."""
+        async def _prepare(event):
+            try:
+                if getattr(event, "source", None) is not None and not event.source.profile:
+                    event.source.profile = profile_name
+            except Exception:
+                pass
+            return await self._prepare_gateway_request(event)
+        return _prepare
+
 
     @staticmethod
     def _adapter_credential_fingerprint(adapter: Any) -> Optional[str]:
@@ -8699,7 +9027,363 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    def _gateway_request_payload(self, event: MessageEvent) -> str:
+        source = event.source
+        payload = {
+            "version": 1,
+            "text": str(event.text or ""),
+            "message_type": getattr(event.message_type, "value", "text"),
+            "replayable": not bool(event.media_urls or event.media_types),
+            "source": {
+                "platform": _gateway_platform_value(source.platform),
+                "chat_id": str(source.chat_id or ""),
+                "chat_type": str(source.chat_type or "dm"),
+                "user_id": str(source.user_id) if source.user_id is not None else None,
+                "user_name": str(source.user_name) if source.user_name is not None else None,
+                "thread_id": str(source.thread_id) if source.thread_id is not None else None,
+                "profile": str(source.profile) if source.profile is not None else None,
+            },
+            "message_id": str(event.message_id) if event.message_id is not None else None,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
+    def _gateway_request_id(
+        platform: str,
+        chat_id: str,
+        platform_message_id: Optional[str],
+    ) -> str:
+        if platform and chat_id and platform_message_id:
+            identity = f"{platform}\0{chat_id}\0{platform_message_id}"
+            return str(uuid.uuid5(_GATEWAY_REQUEST_NAMESPACE, identity))
+        return str(uuid.uuid4())
+
+    async def _observe_gateway_delivery(
+        self,
+        event: MessageEvent,
+        response: str,
+        result: Any,
+    ) -> None:
+        """Persist the outcome of one actual adapter terminal-send attempt."""
+        metadata = event.metadata
+        if metadata.get("_gateway_delivery_observed"):
+            return
+        if not metadata.get("_gateway_ledger_enabled"):
+            return
+        request_id = str(metadata.get("request_id") or "")
+        db = getattr(self.session_store, "_db", None)
+        if not request_id or db is None:
+            return
+        metadata["_gateway_delivery_observed"] = True
+        if getattr(result, "success", False):
+            db.finish_gateway_request_delivery(
+                request_id,
+                delivery_state="DELIVERED",
+                delivery_message_id=(
+                    str(result.message_id)
+                    if getattr(result, "message_id", None) is not None
+                    else None
+                ),
+            )
+            terminal_status = str(
+                metadata.get("_gateway_terminal_status") or "FINAL"
+            )
+            public_error = (
+                str(metadata.get("_gateway_public_error"))
+                if metadata.get("_gateway_public_error")
+                else None
+            )
+            db.compare_and_set_gateway_request_status(
+                request_id,
+                from_statuses=["WORKING"],
+                to_status=terminal_status,
+                response_hash=(
+                    _gateway_response_hash(response)
+                    if terminal_status in {"FINAL", "PARTIAL"}
+                    else None
+                ),
+                public_error=public_error if terminal_status == "FAILED" else None,
+            )
+            return
+        db.finish_gateway_request_delivery(
+            request_id,
+            delivery_state="FAILED",
+        )
+        db.compare_and_set_gateway_request_status(
+            request_id,
+            from_statuses=["WORKING"],
+            to_status="FAILED",
+            public_error=_GATEWAY_DELIVERY_FAILED_MESSAGE,
+        )
+
+    async def _finish_inline_gateway_request(
+        self,
+        event: MessageEvent,
+        *,
+        response: str = "",
+        delivery_result: Any = None,
+    ) -> None:
+        """Close a prepared request handled outside the normal agent turn."""
+        metadata = event.metadata
+        if metadata.get("_gateway_inline_completed"):
+            return
+        metadata["_gateway_inline_completed"] = True
+        request_id = str(metadata.get("request_id") or "")
+        db = (
+            getattr(self.session_store, "_db", None)
+            if metadata.get("_gateway_ledger_enabled")
+            else None
+        )
+        try:
+            if db is not None and request_id:
+                db.compare_and_set_gateway_request_status(
+                    request_id,
+                    from_statuses=["RECEIVED", "QUEUED"],
+                    to_status="WORKING",
+                )
+                if delivery_result is not None:
+                    db.claim_gateway_request_delivery(request_id)
+                    await self._observe_gateway_delivery(
+                        event,
+                        response,
+                        delivery_result,
+                    )
+                else:
+                    db.compare_and_set_gateway_request_status(
+                        request_id,
+                        from_statuses=["WORKING"],
+                        to_status="FINAL",
+                        response_hash=_gateway_response_hash(response),
+                    )
+        finally:
+            lease = metadata.pop("_gateway_admission_lease", None)
+            if lease is not None:
+                await lease.release()
+
+    async def _prepare_gateway_request(self, event: MessageEvent) -> bool:
+        """Durably identify an inbound before adapter-level busy queueing."""
+        if event.metadata.get("_gateway_prepared"):
+            return True
+        source = event.source
+        replay = bool(event.metadata.get("_gateway_ledger_replay"))
+        continuation = bool(event.metadata.get("_gateway_continuation"))
+        if getattr(event, "internal", False) and not replay:
+            return True
+        if (
+            getattr(self, "_startup_restore_in_progress", False)
+            and not getattr(event, "_hermes_startup_restore_replay", False)
+        ):
+            return True
+        if (
+            not getattr(event, "internal", False)
+            and not self._is_user_authorized(source)
+        ):
+            return True
+        platform = _gateway_platform_value(source.platform)
+        chat_id = str(source.chat_id or "").strip()
+        platform_message_id = (
+            str(event.message_id).strip()
+            if event.message_id is not None and str(event.message_id).strip()
+            else None
+        )
+        request_id = str(event.metadata.get("request_id") or "").strip()
+        if not request_id:
+            request_id = self._gateway_request_id(
+                platform, chat_id, platform_message_id
+            )
+        client_message_id = str(
+            event.metadata.get("client_message_id")
+            or platform_message_id
+            or request_id
+        )
+        event.metadata["request_id"] = request_id
+        event.metadata["client_message_id"] = client_message_id
+        event.metadata["_gateway_delivery_observer"] = (
+            lambda response, result: self._observe_gateway_delivery(
+                event, response, result
+            )
+        )
+        db = getattr(self.session_store, "_db", None)
+        created = True
+        if db is not None:
+            create_result = db.create_or_get_gateway_request(
+                request_id=request_id,
+                platform=platform or "unknown",
+                session_key=self._session_key_for_source(source),
+                user_id=str(source.user_id) if source.user_id is not None else None,
+                chat_id=chat_id or "unknown",
+                thread_id=(
+                    str(source.thread_id) if source.thread_id is not None else None
+                ),
+                platform_message_id=platform_message_id,
+                client_message_id=client_message_id,
+                payload_json=self._gateway_request_payload(event),
+                received_at=event.timestamp.timestamp(),
+            )
+            if isinstance(create_result, tuple) and len(create_result) == 2:
+                _, created = create_result
+                event.metadata["_gateway_ledger_enabled"] = True
+            else:
+                db = None
+        event.metadata["_gateway_prepared"] = True
+        if not created and not replay and not continuation:
+            logger.info(
+                "Suppressing duplicate inbound request %s (%s/%s)",
+                request_id,
+                platform,
+                chat_id,
+            )
+            return False
+
+        scheduler = getattr(self, "_admission_scheduler", None)
+        if scheduler is None:
+            scheduler = AdmissionScheduler(
+                heavy_capacity=2,
+                short_capacity=2,
+                queue_capacity=10,
+            )
+            self._admission_scheduler = scheduler
+        lane = _gateway_request_lane(event.text)
+        lane_capacity = (
+            scheduler.heavy_capacity
+            if lane is AdmissionLane.HEAVY
+            else scheduler.short_capacity
+        )
+        if (
+            db is not None
+            and scheduler.active_count_for(lane) >= lane_capacity
+        ):
+            db.compare_and_set_gateway_request_status(
+                request_id,
+                from_statuses=["RECEIVED"],
+                to_status="QUEUED",
+            )
+        try:
+            lease = await scheduler.acquire(
+                request_id=request_id,
+                session_key=self._session_key_for_source(source),
+                lane=lane,
+            )
+        except QueueFullError:
+            if db is not None:
+                db.compare_and_set_gateway_request_status(
+                    request_id,
+                    from_statuses=["RECEIVED", "QUEUED"],
+                    to_status="FAILED",
+                    public_error=_GATEWAY_QUEUE_FULL_MESSAGE,
+                )
+                db.claim_gateway_request_delivery(request_id)
+            event.metadata["_gateway_terminal_status"] = "FAILED"
+            event.metadata["_gateway_public_error"] = _GATEWAY_QUEUE_FULL_MESSAGE
+            event.metadata["_gateway_prepare_response"] = (
+                _GATEWAY_QUEUE_FULL_MESSAGE
+            )
+            return True
+        event.metadata["_gateway_admission_lease"] = lease
+        event.metadata["_gateway_admitted"] = True
+        return True
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+        """Apply durable admission and delivery ownership around real dispatch."""
+        if (
+            getattr(self, "_startup_restore_in_progress", False)
+            and not getattr(event, "internal", False)
+            and not getattr(event, "_hermes_startup_restore_replay", False)
+        ):
+            return await self._handle_message_without_ledger(event)
+
+        source = event.source
+        replay = bool(event.metadata.get("_gateway_ledger_replay"))
+        continuation = bool(event.metadata.get("_gateway_continuation"))
+        if getattr(event, "internal", False) and not replay:
+            return await self._handle_message_without_ledger(event)
+        if (
+            not getattr(event, "internal", False)
+            and not self._is_user_authorized(source)
+        ):
+            return await self._handle_message_without_ledger(event)
+        if not await self._prepare_gateway_request(event):
+            return None
+        prepared_response = event.metadata.get("_gateway_prepare_response")
+        if prepared_response:
+            return str(prepared_response)
+        request_id = str(event.metadata["request_id"])
+        db = (
+            getattr(self.session_store, "_db", None)
+            if event.metadata.get("_gateway_ledger_enabled")
+            else None
+        )
+        lease = event.metadata.get("_gateway_admission_lease")
+
+        try:
+            if db is not None:
+                db.compare_and_set_gateway_request_status(
+                    request_id,
+                    from_statuses=["RECEIVED", "QUEUED"],
+                    to_status="WORKING",
+                )
+                if db.claim_gateway_request_delivery(request_id) is None:
+                    logger.info(
+                        "Suppressing request %s because terminal delivery is owned",
+                        request_id,
+                    )
+                    return None
+            response = await self._handle_message_without_ledger(event)
+            if (
+                db is not None
+                and not response
+                and not event.metadata.get("_gateway_delivery_observed")
+            ):
+                # Silence/steering has no terminal platform send to observe.
+                # Close the lifecycle without inventing delivery evidence.
+                db.finish_gateway_request_delivery(
+                    request_id,
+                    delivery_state="FAILED",
+                )
+                db.compare_and_set_gateway_request_status(
+                    request_id,
+                    from_statuses=["WORKING"],
+                    to_status="FINAL",
+                    response_hash=_gateway_response_hash(""),
+                )
+            return response
+        except asyncio.CancelledError:
+            if db is not None:
+                db.finish_gateway_request_delivery(
+                    request_id,
+                    delivery_state="FAILED",
+                )
+                if getattr(self, "_draining", False):
+                    db.compare_and_set_gateway_request_status(
+                        request_id,
+                        from_statuses=["WORKING"],
+                        to_status="QUEUED",
+                    )
+                else:
+                    db.compare_and_set_gateway_request_status(
+                        request_id,
+                        from_statuses=["WORKING"],
+                        to_status="FAILED",
+                        public_error=_GATEWAY_REQUEST_FAILED_MESSAGE,
+                    )
+            raise
+        except Exception:
+            logger.exception("Gateway request %s failed", request_id)
+            event.metadata["_gateway_terminal_status"] = "FAILED"
+            event.metadata["_gateway_public_error"] = _GATEWAY_REQUEST_FAILED_MESSAGE
+            if db is not None:
+                db.compare_and_set_gateway_request_status(
+                    request_id,
+                    from_statuses=["RECEIVED", "QUEUED", "WORKING"],
+                    to_status="FAILED",
+                    public_error=_GATEWAY_REQUEST_FAILED_MESSAGE,
+                )
+            return _GATEWAY_REQUEST_FAILED_MESSAGE
+        finally:
+            if lease is not None:
+                await lease.release()
+
+    async def _handle_message_without_ledger(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
         
@@ -9353,6 +10037,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 adapter = self._adapter_for_source(source)
                 if adapter:
+                    if event.metadata.get("_gateway_ledger_enabled"):
+                        event.metadata["_gateway_continuation"] = True
                     if self._busy_input_mode == "queue":
                         self._enqueue_fifo(_quick_key, event, adapter)
                     else:
@@ -9376,6 +10062,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # agent starts.
                 adapter = self._adapter_for_source(source)
                 if adapter:
+                    if event.metadata.get("_gateway_ledger_enabled"):
+                        event.metadata["_gateway_continuation"] = True
                     merge_pending_message_event(
                         adapter._pending_messages,
                         _quick_key,
@@ -10106,20 +10794,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # message arriving during any of those yields would pass the
         # "already running" guard and spin up a duplicate agent for the
         # same session — corrupting the transcript.
-        _active_session_lease, _limit_message = self._claim_active_session_slot(
-            _quick_key,
-            source,
-        )
-        if _limit_message is not None:
-            logger.info(
-                "Rejecting new active session %s: max_concurrent_sessions reached",
+        _active_session_lease = None
+        _limit_message = None
+        if not event.metadata.get("_gateway_admitted"):
+            # Non-runner and legacy call paths retain the configured global
+            # safety cap. Runner-backed adapter work is already bounded by the
+            # lane scheduler, which must be allowed to queue rather than reject.
+            _active_session_lease, _limit_message = self._claim_active_session_slot(
                 _quick_key,
+                source,
             )
-            return _limit_message
-        if _active_session_lease is not None:
-            if not hasattr(self, "_active_session_leases"):
-                self._active_session_leases = {}
-            self._active_session_leases[_quick_key] = _active_session_lease
+            if _limit_message is not None:
+                logger.info(
+                    "Rejecting new active session %s: max_concurrent_sessions reached",
+                    _quick_key,
+                )
+                return _limit_message
+            if _active_session_lease is not None:
+                if not hasattr(self, "_active_session_leases"):
+                    self._active_session_leases = {}
+                self._active_session_leases[_quick_key] = _active_session_lease
         self._running_agents[_quick_key] = _AGENT_PENDING_SENTINEL
         self._running_agents_ts[_quick_key] = time.time()
         self._persist_active_agents()
@@ -11854,6 +12548,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key, session_entry.session_id
             )
 
+            if agent_result.get("failed"):
+                event.metadata["_gateway_terminal_status"] = "FAILED"
+                event.metadata["_gateway_public_error"] = (
+                    _GATEWAY_REQUEST_FAILED_MESSAGE
+                )
+            elif agent_result.get("partial"):
+                event.metadata["_gateway_terminal_status"] = "PARTIAL"
+            else:
+                event.metadata["_gateway_terminal_status"] = "FINAL"
+
             # Intentional silence is a delivery decision, not a transcript
             # mutation.  The agent's [SILENT]/NO_REPLY assistant turn above is
             # still persisted in session history so later turns keep normal
@@ -11883,6 +12587,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # partial output before the failure).  Without this guard,
             # users see the agent "stop responding without explanation."
             if agent_result.get("already_sent") and not agent_result.get("failed"):
+                observer = event.metadata.get("_gateway_delivery_observer")
+                if callable(observer):
+                    from types import SimpleNamespace
+
+                    observed = observer(
+                        response,
+                        SimpleNamespace(
+                            success=True,
+                            message_id=agent_result.get("delivery_message_id"),
+                        ),
+                    )
+                    if inspect.isawaitable(observed):
+                        await observed
                 if response:
                     _media_adapter = self._adapter_for_source(source)
                     if _media_adapter:
@@ -11909,6 +12626,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return response
             
         except Exception as e:
+            event.metadata["_gateway_terminal_status"] = "FAILED"
+            event.metadata["_gateway_public_error"] = (
+                _GATEWAY_REQUEST_FAILED_MESSAGE
+            )
             # Stop typing indicator on error too
             try:
                 _err_adapter = self._adapter_for_source(source)
@@ -19780,6 +20501,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _content_delivered,
                 )
                 response["already_sent"] = True
+                response["delivery_message_id"] = (
+                    str(_sc.message_id)
+                    if _sc is not None and getattr(_sc, "message_id", None)
+                    else None
+                )
             elif not _is_empty_sentinel and _transformed and _sc is not None:
                 # Plugin hooks transformed the response after streaming — edit the
                 # existing streamed message instead of sending a duplicate.
@@ -19793,6 +20519,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             finalize=True,
                         )
                         response["already_sent"] = True
+                        response["delivery_message_id"] = str(_sc_msg_id)
                         logger.info(
                             "Edited streamed message %s for session %s to include plugin-transformed content.",
                             _sc_msg_id, session_key or "?",

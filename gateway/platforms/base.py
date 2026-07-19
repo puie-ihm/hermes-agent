@@ -85,6 +85,21 @@ def _mark_notify_metadata(metadata: dict | None) -> dict:
     return notify_metadata
 
 
+def _gateway_delivery_metadata(event, metadata: dict | None) -> dict:
+    """Carry request identity and the runner's actual-send observer to egress."""
+    merged = dict(metadata) if metadata else {}
+    event_metadata = getattr(event, "metadata", None)
+    if not isinstance(event_metadata, dict):
+        return merged
+    for key in (
+        "request_id",
+        "client_message_id",
+    ):
+        if key in event_metadata:
+            merged[key] = event_metadata[key]
+    return merged
+
+
 def _reply_anchor_for_event(event) -> str | None:
     """Return reply_to id for platforms that need reply semantics.
 
@@ -2775,14 +2790,18 @@ class BasePlatformAdapter(ABC):
         """Check if adapter is currently connected."""
         return self._running
     
-    def set_message_handler(self, handler: MessageHandler) -> None:
-        """
-        Set the handler for incoming messages.
-        
-        The handler receives a MessageEvent and should return
-        an optional response string.
-        """
+    def set_message_handler(
+        self,
+        handler: MessageHandler,
+        *,
+        prepare_handler: Optional[Callable[[MessageEvent], Any]] = None,
+    ) -> None:
+        """Set the inbound handler and its optional durable prepare hook."""
         self._message_handler = handler
+        owner = getattr(handler, "__self__", None)
+        discovered_prepare = getattr(owner, "_prepare_gateway_request", None)
+        prepare = prepare_handler or discovered_prepare
+        self._request_prepare_handler = prepare if callable(prepare) else None
 
     def set_topic_recovery_fn(
         self,
@@ -3195,7 +3214,7 @@ class BasePlatformAdapter(ABC):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send a batch of images.
 
         Accepts ``http(s)://``, ``file://`` URIs in the first tuple
@@ -3209,6 +3228,8 @@ class BasePlatformAdapter(ABC):
         (e.g. Signal's multi-attachment RPC)
         """
         from urllib.parse import unquote as _unquote
+        successful_result: Optional[SendResult] = None
+        failed_result: Optional[SendResult] = None
 
         for image_url, alt_text in images:
             if human_delay > 0:
@@ -3241,10 +3262,18 @@ class BasePlatformAdapter(ABC):
                         caption=alt_text if alt_text else None,
                         metadata=metadata,
                     )
-                if not img_result.success:
+                if img_result.success:
+                    successful_result = img_result
+                else:
+                    failed_result = img_result
                     logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
             except Exception as img_err:
+                failed_result = SendResult(success=False, error=str(img_err))
                 logger.error("[%s] Error sending image: %s", self.name, img_err, exc_info=True)
+        return successful_result or failed_result or SendResult(
+            success=False,
+            error="no images were delivered",
+        )
 
     async def send_image(
         self,
@@ -4088,88 +4117,123 @@ class BasePlatformAdapter(ABC):
         metadata: Any = None,
         max_retries: int = 2,
         base_delay: float = 2.0,
+        delivery_observer: Optional[Callable] = None,
     ) -> "SendResult":
-        """
-        Send a message with automatic retry for transient network errors.
+        """Send with bounded retries and report the one terminal send result."""
+        send_metadata = dict(metadata) if isinstance(metadata, dict) else metadata
+        if isinstance(send_metadata, dict):
+            send_metadata.pop("_gateway_delivery_observer", None)
 
-        On permanent failures (e.g. formatting / permission errors) falls back
-        to a plain-text version before giving up. If all attempts fail due to
-        network errors, sends the user a brief delivery-failure notice so they
-        know to retry rather than waiting indefinitely.
-        """
+        async def _observe(result: "SendResult") -> "SendResult":
+            observer = delivery_observer
+            if callable(observer):
+                try:
+                    observed = observer(content, result)
+                    if inspect.isawaitable(observed):
+                        await observed
+                except Exception:
+                    logger.exception(
+                        "[%s] Gateway delivery observer failed",
+                        self.name,
+                    )
+            return result
 
         result = await self.send(
             chat_id=chat_id,
             content=content,
             reply_to=reply_to,
-            metadata=metadata,
+            metadata=send_metadata,
         )
-
         if result.success:
-            return result
+            return await _observe(result)
 
         error_str = result.error or ""
         is_network = result.retryable or self._is_retryable_error(error_str)
-
-        # Timeout errors are not safe to retry (message may have been
-        # delivered) and not formatting errors — return the failure as-is.
         if not is_network and self._is_timeout_error(error_str):
-            return result
+            return await _observe(result)
 
         if is_network:
-            # Retry with exponential backoff for transient errors.
-            # Honor server-requested retry_after (e.g. Telegram FloodWait)
-            # when present — it is authoritative over our backoff schedule.
             server_retry_after = result.retry_after
             for attempt in range(1, max_retries + 1):
                 if server_retry_after is not None:
                     delay = server_retry_after + random.uniform(0, 1)
-                    server_retry_after = None  # only honor once per send
+                    server_retry_after = None
                 else:
                     delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
                 logger.warning(
                     "[%s] Send failed (attempt %d/%d, retrying in %.1fs): %s",
-                    self.name, attempt, max_retries, delay, error_str,
+                    self.name,
+                    attempt,
+                    max_retries,
+                    delay,
+                    error_str,
                 )
                 await asyncio.sleep(delay)
                 result = await self.send(
                     chat_id=chat_id,
                     content=content,
                     reply_to=reply_to,
-                    metadata=metadata,
+                    metadata=send_metadata,
                 )
                 if result.success:
-                    logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
-                    return result
+                    logger.info(
+                        "[%s] Send succeeded on retry %d",
+                        self.name,
+                        attempt,
+                    )
+                    return await _observe(result)
                 error_str = result.error or ""
                 if result.retry_after is not None:
                     server_retry_after = result.retry_after
-                if not (result.retryable or self._is_retryable_error(error_str)):
-                    break  # error switched to non-transient — fall through to plain-text fallback
+                if not (
+                    result.retryable or self._is_retryable_error(error_str)
+                ):
+                    break
             else:
-                # All retries exhausted (loop completed without break) — notify user
-                logger.error("[%s] Failed to deliver response after %d retries: %s", self.name, max_retries, error_str)
+                logger.error(
+                    "[%s] Failed to deliver response after %d retries: %s",
+                    self.name,
+                    max_retries,
+                    error_str,
+                )
                 notice = (
-                    "\u26a0\ufe0f Message delivery failed after multiple attempts. "
-                    "Please try again \u2014 your request was processed but the response could not be sent."
+                    "⚠️ Message delivery failed after multiple attempts. "
+                    "Please try again — your request was processed but the "
+                    "response could not be sent."
                 )
                 try:
-                    await self.send(chat_id=chat_id, content=notice, reply_to=reply_to, metadata=metadata)
+                    await self.send(
+                        chat_id=chat_id,
+                        content=notice,
+                        reply_to=reply_to,
+                        metadata=send_metadata,
+                    )
                 except Exception as notify_err:
-                    logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
-                return result
+                    logger.debug(
+                        "[%s] Could not send delivery-failure notice: %s",
+                        self.name,
+                        notify_err,
+                    )
+                return await _observe(result)
 
-        # Non-network / post-retry formatting failure: try plain text as fallback
-        logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
+        logger.warning(
+            "[%s] Send failed: %s — trying plain-text fallback",
+            self.name,
+            error_str,
+        )
         fallback_result = await self.send(
             chat_id=chat_id,
             content=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
             reply_to=reply_to,
-            metadata=metadata,
+            metadata=send_metadata,
         )
         if not fallback_result.success:
-            logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
-        return fallback_result
+            logger.error(
+                "[%s] Fallback send also failed: %s",
+                self.name,
+                fallback_result.error,
+            )
+        return await _observe(fallback_result)
 
     @staticmethod
     def _merge_caption(existing_text: Optional[str], new_text: str) -> str:
@@ -4565,7 +4629,12 @@ class BasePlatformAdapter(ABC):
                     chat_id=event.source.chat_id,
                     content=_text,
                     reply_to=_reply_anchor_for_event(event),
-                    metadata=_mark_notify_metadata(thread_meta),
+                    metadata=_mark_notify_metadata(
+                        _gateway_delivery_metadata(event, thread_meta)
+                    ),
+                    delivery_observer=event.metadata.get(
+                        "_gateway_delivery_observer"
+                    ),
                 )
                 if _eph_ttl > 0 and _r.success and _r.message_id:
                     self._schedule_ephemeral_delete(
@@ -4617,12 +4686,57 @@ class BasePlatformAdapter(ABC):
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
 
+        prepare = getattr(self, "_request_prepare_handler", None)
+        if callable(prepare):
+            try:
+                accepted = prepare(event)
+                if inspect.isawaitable(accepted):
+                    accepted = await accepted
+                if accepted is False:
+                    return
+                prepared_response = event.metadata.get(
+                    "_gateway_prepare_response"
+                )
+                if prepared_response:
+                    await self._send_with_retry(
+                        chat_id=event.source.chat_id,
+                        content=str(prepared_response),
+                        reply_to=_reply_anchor_for_event(event),
+                        metadata=_gateway_delivery_metadata(event, None),
+                        delivery_observer=event.metadata.get(
+                            "_gateway_delivery_observer"
+                        ),
+                    )
+                    return
+            except Exception:
+                logger.exception(
+                    "[%s] Durable request preparation failed",
+                    self.name,
+                )
+                return
+
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or
         # cancelled), the lock is stale.  Clear it and fall through to
         # normal dispatch so the user isn't trapped behind a dead guard —
         # this is the split-brain tail described in issue #11016.
         if session_key in self._active_sessions:
+            self._heal_stale_session_lock(session_key)
+
+        if (
+            event.metadata.get("_gateway_ledger_replay")
+            and session_key in self._active_sessions
+        ):
+            active_task = self._session_tasks.get(session_key)
+            if (
+                active_task is not None
+                and active_task is not asyncio.current_task()
+                and not active_task.done()
+            ):
+                try:
+                    await asyncio.shield(active_task)
+                except Exception:
+                    pass
             self._heal_stale_session_lock(session_key)
 
         # Check if there's already an active handler for this session
@@ -4672,7 +4786,12 @@ class BasePlatformAdapter(ABC):
                             chat_id=event.source.chat_id,
                             content=_text,
                             reply_to=_reply_anchor_for_event(event),
-                            metadata=_mark_notify_metadata(_thread_meta),
+                            metadata=_mark_notify_metadata(
+                                _gateway_delivery_metadata(event, _thread_meta)
+                            ),
+                            delivery_observer=event.metadata.get(
+                                "_gateway_delivery_observer"
+                            ),
                         )
                         if _eph_ttl > 0 and _r.success and _r.message_id:
                             self._schedule_ephemeral_delete(
@@ -4725,7 +4844,12 @@ class BasePlatformAdapter(ABC):
                                 chat_id=event.source.chat_id,
                                 content=_text,
                                 reply_to=_reply_anchor_for_event(event),
-                                metadata=_mark_notify_metadata(_thread_meta),
+                                metadata=_mark_notify_metadata(
+                                    _gateway_delivery_metadata(event, _thread_meta)
+                                ),
+                                delivery_observer=event.metadata.get(
+                                    "_gateway_delivery_observer"
+                                ),
                             )
                             if _eph_ttl > 0 and _r.success and _r.message_id:
                                 self._schedule_ephemeral_delete(
@@ -4864,14 +4988,20 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        last_delivery_result = None
+        successful_delivery_result = None
+        terminal_response_text = ""
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
+            nonlocal last_delivery_result, successful_delivery_result
             if result is None:
                 return
             delivery_attempted = True
+            last_delivery_result = result
             if getattr(result, "success", False):
                 delivery_succeeded = True
+                successful_delivery_result = result
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -4965,6 +5095,7 @@ class BasePlatformAdapter(ABC):
 
                 # Pre-extract snapshot for the #29346 recovery/invariant below.
                 _response_pre_extract = response
+                terminal_response_text = _response_pre_extract
 
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
                 media_files, response = self.extract_media(response)
@@ -5013,7 +5144,9 @@ class BasePlatformAdapter(ABC):
                 # the existing notify=True marker. Clone once so typing/status
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
-                _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                _final_thread_metadata = _mark_notify_metadata(
+                    _gateway_delivery_metadata(event, _thread_metadata)
+                )
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
@@ -5059,6 +5192,7 @@ class BasePlatformAdapter(ABC):
                         _tts_caption_delivered = bool(
                             telegram_tts_caption and getattr(tts_result, "success", False)
                         )
+                        _record_delivery(tts_result)
                     finally:
                         try:
                             os.remove(_tts_path)
@@ -5099,13 +5233,21 @@ class BasePlatformAdapter(ABC):
                 if images:
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
                     try:
-                        await self.send_multiple_images(
+                        image_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=images,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(
+                            image_result
+                            or SendResult(
+                                success=False,
+                                error="batch image sender returned no delivery result",
+                            )
+                        )
                     except Exception as batch_err:
+                        _record_delivery(SendResult(success=False, error=str(batch_err)))
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
 
@@ -5141,13 +5283,21 @@ class BasePlatformAdapter(ABC):
                 if _image_paths:
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
+                        image_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(
+                            image_result
+                            or SendResult(
+                                success=False,
+                                error="batch image sender returned no delivery result",
+                            )
+                        )
                     except Exception as batch_err:
+                        _record_delivery(SendResult(success=False, error=str(batch_err)))
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
                 for media_path, is_voice in _non_image_media:
@@ -5173,10 +5323,12 @@ class BasePlatformAdapter(ABC):
                                 file_path=media_path,
                                 metadata=_final_thread_metadata,
                             )
+                        _record_delivery(media_result)
 
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
                     except Exception as media_err:
+                        _record_delivery(SendResult(success=False, error=str(media_err)))
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
 
                 # Send auto-detected local non-image files as native attachments
@@ -5186,18 +5338,20 @@ class BasePlatformAdapter(ABC):
                     try:
                         ext = Path(file_path).suffix.lower()
                         if ext in _VIDEO_EXTS:
-                            await self.send_video(
+                            file_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
                         else:
-                            await self.send_document(
+                            file_result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
+                        _record_delivery(file_result)
                     except Exception as file_err:
+                        _record_delivery(SendResult(success=False, error=str(file_err)))
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
 
                 # A3 (#29346): if a non-empty response produced nothing
@@ -5213,6 +5367,19 @@ class BasePlatformAdapter(ABC):
                         "for %s (empty after extract, recovery yielded nothing).",
                         self.name, len(_response_pre_extract), event.source.chat_id,
                     )
+
+            if (
+                last_delivery_result is not None
+                and not event.metadata.get("_gateway_delivery_observed")
+            ):
+                observer = event.metadata.get("_gateway_delivery_observer")
+                if callable(observer):
+                    observed = observer(
+                        terminal_response_text,
+                        successful_delivery_result or last_delivery_result,
+                    )
+                    if inspect.isawaitable(observed):
+                        await observed
 
             # Determine overall success for the processing hook
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
@@ -5276,17 +5443,28 @@ class BasePlatformAdapter(ABC):
         except Exception as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
+            observer = event.metadata.get("_gateway_delivery_observer")
+            if callable(observer):
+                try:
+                    observed = observer("", SendResult(success=False))
+                    if inspect.isawaitable(observed):
+                        await observed
+                except Exception:
+                    logger.exception(
+                        "[%s] Gateway failure observer failed",
+                        self.name,
+                    )
             # Send the error to the user so they aren't left with radio silence
             try:
-                error_type = type(e).__name__
-                error_detail = str(e)[:300] if str(e) else "no details available"
-                _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+                _thread_metadata = _thread_metadata_for_source(
+                    event.source,
+                    _reply_anchor_for_event(event),
+                )
                 await self.send(
                     chat_id=event.source.chat_id,
                     content=(
-                        f"Sorry, I encountered an error ({error_type}).\n"
-                        f"{error_detail}\n"
-                        "Try again or use /reset to start a fresh session."
+                        "Sorry, I couldn’t complete your request. "
+                        "Please try again or use /reset to start a fresh session."
                     ),
                     metadata=_thread_metadata,
                 )

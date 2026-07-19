@@ -690,3 +690,22 @@ async def test_same_session_prequeue_stays_replayable_until_handler_starts(runne
     )
     assert final["status"] == "FINAL"
     assert final["delivery_state"] == "DELIVERED"
+
+
+@pytest.mark.asyncio
+async def test_drain_interrupted_empty_response_requeues_request(runner):
+    async def handle(_event):
+        return None
+
+    runner._draining = True
+    runner._handle_message_without_ledger = handle
+    event = _event("drain-empty")
+
+    assert await runner._handle_message(event) is None
+
+    row = runner.session_store._db.get_gateway_request(
+        event.metadata["request_id"]
+    )
+    assert row["status"] == "QUEUED"
+    assert row["delivery_state"] == "FAILED"
+    assert runner._admission_scheduler.active_count == 0

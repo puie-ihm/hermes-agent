@@ -9334,18 +9334,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and not response
                 and not event.metadata.get("_gateway_delivery_observed")
             ):
-                # Silence/steering has no terminal platform send to observe.
-                # Close the lifecycle without inventing delivery evidence.
                 db.finish_gateway_request_delivery(
                     request_id,
                     delivery_state="FAILED",
                 )
-                db.compare_and_set_gateway_request_status(
-                    request_id,
-                    from_statuses=["WORKING"],
-                    to_status="FINAL",
-                    response_hash=_gateway_response_hash(""),
-                )
+                if getattr(self, "_draining", False):
+                    # A graceful drain interrupt can return an empty response
+                    # before asyncio cancellation reaches this task. Keep the
+                    # durable request replayable rather than terminalizing it
+                    # while resume_pending remains set.
+                    db.compare_and_set_gateway_request_status(
+                        request_id,
+                        from_statuses=["WORKING"],
+                        to_status="QUEUED",
+                    )
+                else:
+                    # Silence/steering outside a drain has no terminal platform
+                    # send to observe; close it without inventing delivery.
+                    db.compare_and_set_gateway_request_status(
+                        request_id,
+                        from_statuses=["WORKING"],
+                        to_status="FINAL",
+                        response_hash=_gateway_response_hash(""),
+                    )
             return response
         except asyncio.CancelledError:
             if db is not None:

@@ -2938,7 +2938,12 @@ class SlackAdapter(BasePlatformAdapter):
         source = self.build_source(
             chat_id=channel_id,
             chat_name=channel_id,
-            chat_type="dm",
+            # Match the inbound-handler session-key rule: only a genuine 1:1 DM
+            # (D-prefixed channel) keys as "dm"; a C-prefixed shared assistant
+            # container is an MPIM-style surface and keys as "group", so the
+            # seeded session key can't diverge from the one the message handler
+            # builds for the same thread.
+            chat_type="dm" if channel_id.startswith("D") else "group",
             user_id=user_id,
             thread_id=thread_ts,
             chat_topic=metadata.get("context_channel_id") or None,
@@ -2975,7 +2980,9 @@ class SlackAdapter(BasePlatformAdapter):
         source = self.build_source(
             chat_id=channel_id,
             chat_name=channel_id,
-            chat_type="dm",
+            # Same session-key rule as the message handler: 1:1 DM (D-prefix) →
+            # "dm"; a shared/MPIM-style container → "group".
+            chat_type="dm" if channel_id.startswith("D") else "group",
             user_id=user_id,
             chat_topic=metadata.get("context_channel_id") or None,
             scope_id=metadata.get("team_id") or None,
@@ -3361,6 +3368,23 @@ class SlackAdapter(BasePlatformAdapter):
         # only genuine 1:1 DMs are mention-exempt; group DMs/channels obey
         # require_mention/strict_mention.
         is_one_to_one_dm = channel_type == "im" and channel_id.startswith("D")
+
+        # Session-key chat_type — DELIBERATELY DISTINCT from ``is_dm`` above.
+        #
+        # ``is_dm`` (im OR mpim) drives routing / reaction / security GATING,
+        # where an MPIM (group DM) is correctly treated as a persistent DM-style
+        # surface. That gating MUST NOT change.
+        #
+        # But for the SESSION KEY an MPIM is a SHARED, multi-party surface and
+        # must be keyed as "group" — exactly like the slash-command and
+        # ``_has_active_session_for_thread`` paths already do. Keying MPIMs off
+        # ``is_dm`` split the SAME thread across two session keys: a plain
+        # ``message`` event (channel_type="mpim" → is_dm) landed on
+        # ``slack:dm:…`` while an ``app_mention`` (no channel_type, C/G-prefixed
+        # → not is_dm) landed on ``slack:group:…``, so the bot "forgot"
+        # mid-thread. Only a genuine 1:1 DM (im + D-prefix = is_one_to_one_dm)
+        # keys as "dm"; every other surface (mpim, channel) keys as "group".
+        session_chat_type = "dm" if is_one_to_one_dm else "group"
 
         # Build thread_ts for session keying.
         # In channels: fall back to ts so each top-level @mention starts a
@@ -3824,7 +3848,9 @@ class SlackAdapter(BasePlatformAdapter):
         source = self.build_source(
             chat_id=channel_id,
             chat_name=channel_id,  # Will be resolved later if needed
-            chat_type="dm" if is_dm else "group",
+            # Session-key scoping: MPIMs key as "group" (see session_chat_type
+            # above). ``is_dm`` still governs routing/gating, unchanged.
+            chat_type=session_chat_type,
             user_id=user_id,
             user_name=user_name,
             thread_id=thread_ts,

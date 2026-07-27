@@ -294,6 +294,69 @@ def test_notifier_owning_profile_adapter_no_default_fallback(tmp_path, monkeypat
     assert [ev.kind for ev in _unseen_terminal_events_for(tid, "chat-beta")] == ["completed"]
 
 
+def test_notifier_delivers_when_owning_profile_is_this_gateways_own_profile(
+    tmp_path, monkeypatch,
+):
+    """A dedicated single-profile gateway must deliver ITS OWN profile's subs.
+
+    ``hermes --profile front_external gateway run`` serves front_external out of
+    ``self.adapters``; ``_profile_adapters`` holds only SECONDARY (multiplex)
+    profiles and is empty in such a process. The fail-closed branch in
+    ``_authorization_adapter`` must therefore not treat the process's own active
+    profile as an unregistered secondary profile.
+
+    Regression: upstream ab70551b3 ("fail-closed adapter resolution for
+    unregistered secondary profiles") made every profile-stamped lookup in a
+    non-default gateway return None. The notifier claimed each completion event
+    and immediately rewound the claim on every 5s tick, so kanban
+    completed/blocked wakes were never delivered — silently, with no WARNING and
+    no cursor movement. Observed in prod as front_external (Slack @fabboy) never
+    relaying a finished analyst answer back to the user.
+
+    Mutation check: dropping the ``profile_name == self._active_profile_name()``
+    branch in gateway/authz_mixin.py makes this test FAIL — nothing is sent and
+    the completed event stays unseen.
+    """
+    db_path = tmp_path / "own-profile.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="owned by this gateway", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-own",
+            notifier_profile="front_external",
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    own_adapter = RecordingAdapter()
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    # A dedicated --profile gateway: its only adapter lives in `adapters`, and
+    # the secondary-profile registry is empty because multiplex never ran.
+    runner.adapters = {Platform.TELEGRAM: own_adapter}
+    runner._profile_adapters = {}
+    runner._kanban_sub_fail_counts = {}
+    # This process IS front_external.
+    runner._kanban_notifier_profile = "front_external"
+    monkeypatch.setattr(
+        GatewayRunner, "_active_profile_name", staticmethod(lambda: "front_external"),
+    )
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(own_adapter.sent) == 1, (
+        "A dedicated single-profile gateway must deliver its own profile's "
+        f"kanban notification; got {own_adapter.sent!r}"
+    )
+    assert own_adapter.sent[0]["chat_id"] == "chat-own"
+    # Claim held (not rewound) — the event is consumed, so no redelivery loop.
+    assert _unseen_terminal_events_for(tid, "chat-own") == []
+
+
 def _unseen_terminal_events_for(tid, chat_id):
     conn = kb.connect()
     try:

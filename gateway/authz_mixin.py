@@ -66,12 +66,41 @@ class GatewayAuthorizationMixin:
             profile_adapters = getattr(self, "_profile_adapters", None) or {}
             if profile_name in profile_adapters:
                 return profile_adapters[profile_name].get(platform)
+            # A dedicated single-profile gateway (`hermes --profile X gateway
+            # run`, e.g. hermes-gateway-front_external.service) serves profile X
+            # out of ``self.adapters``; ``_profile_adapters`` only ever holds
+            # SECONDARY profiles started by multiplex, so it is empty here.
+            # Resolving the process's OWN active profile from ``self.adapters``
+            # is not the cross-profile fallback the guard below exists to block
+            # — it is the same bot either way. Without this branch every
+            # profile-stamped lookup in a non-default gateway resolves to None:
+            # the kanban notifier then rewinds its claim on every 5s tick and
+            # completion/blocked wakes are never delivered, silently, forever.
+            if profile_name == self._active_profile_name_or_none():
+                adapters = getattr(self, "adapters", None) or {}
+                return adapters.get(platform)
             # Fail closed: a stamped secondary profile with no registry entry
             # (e.g. its adapter failed to connect) must NOT fall back to the
             # default profile's adapter — that sends replies out the wrong bot.
             return None
         adapters = getattr(self, "adapters", None) or {}
         return adapters.get(platform)
+
+    def _active_profile_name_or_none(self) -> Optional[str]:
+        """This process's active profile name, or ``None`` if unresolvable.
+
+        ``_authorization_adapter`` is reached from test doubles that build a
+        bare runner via ``GatewayRunner.__new__`` and from mixin-only fixtures,
+        so ``_active_profile_name`` is not guaranteed to be bound. Swallowing
+        the lookup failure keeps the caller on its fail-closed path rather than
+        raising out of an authorization decision.
+        """
+        try:
+            name = self._active_profile_name()
+        except Exception:
+            return None
+        name = (name or "").strip()
+        return name or None
 
     def _adapter_for_source(self, source: Optional[SessionSource]):
         """Resolve the live adapter for an inbound ``SessionSource``."""

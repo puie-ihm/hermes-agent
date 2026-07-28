@@ -327,6 +327,24 @@ def decompose_task(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
 
+    # A profile outside kanban auto-routing is outside it in BOTH directions:
+    # it never receives fan-out, and its own tasks are never fanned out.
+    # Without this, an externally-created request would be decomposed and
+    # handed to internal workers — the reverse of the leak _build_roster()
+    # prevents, and just as bad. Gating here rather than in the watcher covers
+    # all three callers (CLI, dashboard, auto-decompose tick) at one point.
+    creator = (getattr(task, "created_by", None) or "").strip()
+    if creator and not _is_auto_assignable(creator):
+        return DecomposeOutcome(
+            task_id,
+            False,
+            f"task was created by {creator!r}, which is outside kanban "
+            f"auto-routing (kanban_auto_assignable: false in its "
+            f"profile.yaml); decomposing it would fan an externally-sourced "
+            f"request out to internal workers. If this work should be picked "
+            f"up, re-file it from an internal profile.",
+        )
+
     cfg = _load_config()
     orchestrator = _resolve_orchestrator_profile(cfg)
     default_assignee = _resolve_default_assignee(cfg)

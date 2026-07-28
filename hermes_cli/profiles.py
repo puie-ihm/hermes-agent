@@ -651,9 +651,10 @@ class ProfileInfo:
     # accept.
     description_auto: bool = False
     # False when ``profile.yaml`` sets ``kanban_auto_assignable: false``.
-    # Such a profile is excluded from the kanban decomposer's roster, so
-    # auto-decompose can never route work to it. Defaults True so existing
-    # profiles and any other ``ProfileInfo`` construction site keep working.
+    # Such a profile is excluded from the kanban decomposer's roster (nothing
+    # routes TO it) and its own tasks are never decomposed (nothing routes
+    # FROM it). Defaults True so existing profiles and any other
+    # ``ProfileInfo`` construction site keep working.
     kanban_auto_assignable: bool = True
 
 
@@ -820,12 +821,15 @@ def _profile_yaml_path(profile_dir: Path) -> Path:
 _PROFILE_META_DEFAULTS = {
     "description": "",
     "description_auto": False,
-    # Opt-out flag: when False this profile is never offered to the kanban
-    # decomposer as a routing target. Declared in the profile's OWN
-    # profile.yaml rather than a central exclude-list so a new locked-down
-    # profile carries its own policy instead of relying on someone
-    # remembering to add it somewhere else. Defaults True — a profile that
-    # says nothing stays routable, which is the pre-existing behavior.
+    # Opt-out flag. Despite the name it governs kanban auto-routing in BOTH
+    # directions: when False, the profile is never offered to the decomposer
+    # as a routing target AND its own tasks are never decomposed (so an
+    # externally-sourced request cannot be fanned out to internal workers).
+    # Declared in the profile's OWN profile.yaml rather than a central
+    # exclude-list so a new locked-down profile carries its own policy
+    # instead of relying on someone remembering to add it somewhere else.
+    # Defaults True — a profile that says nothing stays routable, which is
+    # the pre-existing behavior.
     "kanban_auto_assignable": True,
 }
 

@@ -500,3 +500,108 @@ def test_profiles_without_the_flag_stay_assignable(kanban_home):
         for p in patches:
             p.stop()
     assert valid == {"orchestrator", "engineer"}
+
+
+# ---------------------------------------------------------------------------
+# The reverse direction: a task CREATED BY a non-routable profile must never
+# be fanned out to internal workers. The flag means "outside kanban
+# auto-routing", not merely "not a valid assignee".
+# ---------------------------------------------------------------------------
+
+
+def _fanout_payload():
+    return jsonlib.dumps({
+        "fanout": True,
+        "rationale": "split it",
+        "tasks": [
+            {"title": "step one", "body": "a", "assignee": "orchestrator",
+             "parents": []},
+            {"title": "step two", "body": "b", "assignee": "engineer",
+             "parents": [0]},
+        ],
+    })
+
+
+def test_task_created_by_non_routable_profile_is_refused(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="external buyer question", triage=True,
+            created_by="locked_down_worker",
+        )
+
+    patches = _patch_list_profiles_with_flags([
+        ("orchestrator", True),
+        ("engineer", True),
+        ("locked_down_worker", False),
+    ])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(_fanout_payload()), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert "outside kanban auto-routing" in outcome.reason
+    assert "locked_down_worker" in outcome.reason
+
+    # The outcome alone is not enough — assert nothing was written.
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        children = kb.list_tasks(conn, limit=100)
+    assert task.status == "triage", "refused task must stay in triage"
+    assert len(children) == 1, f"no children may be created, got {len(children)}"
+
+
+def test_task_created_by_internal_profile_still_decomposes(kanban_home):
+    """The gate must not block ordinary internal work."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="internal work", triage=True, created_by="orchestrator",
+        )
+
+    patches = _patch_list_profiles_with_flags([
+        ("orchestrator", True),
+        ("engineer", True),
+        ("locked_down_worker", False),
+    ])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(_fanout_payload()), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.child_ids and len(outcome.child_ids) == 2
+
+
+def test_task_with_unknown_creator_still_decomposes(kanban_home):
+    """`created_by` falls back to 'worker' when the profile is unresolvable.
+
+    Unknown creators must stay permissive — the flag is an explicit opt-out,
+    not an allowlist, and failing closed here would break ordinary dispatch.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="dispatcher work", triage=True, created_by="worker",
+        )
+
+    patches = _patch_list_profiles_with_flags([
+        ("orchestrator", True),
+        ("engineer", True),
+    ])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(_fanout_payload()), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason

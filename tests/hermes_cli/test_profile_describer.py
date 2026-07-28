@@ -26,7 +26,11 @@ def profile_env(tmp_path, monkeypatch):
 
 def test_read_profile_meta_empty_when_missing(profile_env):
     meta = profiles_mod.read_profile_meta(profile_env)
-    assert meta == {"description": "", "description_auto": False}
+    assert meta == {
+        "description": "",
+        "description_auto": False,
+        "kanban_auto_assignable": True,
+    }
 
 
 def test_write_and_read_profile_meta(profile_env):
@@ -63,7 +67,11 @@ def test_write_profile_meta_rejects_missing_dir(tmp_path):
 def test_read_profile_meta_tolerates_corrupt_yaml(profile_env):
     (profile_env / "profile.yaml").write_text("not: valid: yaml: [unclosed")
     meta = profiles_mod.read_profile_meta(profile_env)
-    assert meta == {"description": "", "description_auto": False}
+    assert meta == {
+        "description": "",
+        "description_auto": False,
+        "kanban_auto_assignable": True,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -166,3 +174,48 @@ def test_describer_returns_false_when_profile_missing(profile_env, monkeypatch):
     outcome = describer.describe_profile("ghost")
     assert outcome.ok is False
     assert "not found" in outcome.reason
+
+
+def test_profile_meta_reads_kanban_auto_assignable_flag(tmp_path):
+    """``kanban_auto_assignable`` survives read_profile_meta's key whitelist."""
+    from hermes_cli import profiles as profiles_mod
+
+    d = tmp_path / "locked_down"
+    d.mkdir()
+    (d / "profile.yaml").write_text(
+        'description: "external worker"\n'
+        'description_auto: false\n'
+        'kanban_auto_assignable: false\n',
+        encoding="utf-8",
+    )
+    meta = profiles_mod.read_profile_meta(d)
+    assert meta["kanban_auto_assignable"] is False
+    assert meta["description"] == "external worker"
+
+
+def test_profile_meta_defaults_kanban_auto_assignable_true(tmp_path):
+    from hermes_cli import profiles as profiles_mod
+
+    d = tmp_path / "ordinary"
+    d.mkdir()
+    (d / "profile.yaml").write_text('description: "a worker"\n', encoding="utf-8")
+    assert profiles_mod.read_profile_meta(d)["kanban_auto_assignable"] is True
+
+    missing = tmp_path / "no_yaml"
+    missing.mkdir()
+    assert profiles_mod.read_profile_meta(missing)["kanban_auto_assignable"] is True
+
+
+def test_write_profile_meta_preserves_kanban_auto_assignable(tmp_path):
+    """The describer rewrites description; it must not strip the opt-out."""
+    from hermes_cli import profiles as profiles_mod
+
+    d = tmp_path / "locked_down"
+    d.mkdir()
+    (d / "profile.yaml").write_text(
+        'description: "old"\nkanban_auto_assignable: false\n', encoding="utf-8"
+    )
+    profiles_mod.write_profile_meta(d, description="new", description_auto=True)
+    meta = profiles_mod.read_profile_meta(d)
+    assert meta["description"] == "new"
+    assert meta["kanban_auto_assignable"] is False

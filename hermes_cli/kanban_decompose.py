@@ -198,20 +198,46 @@ def _resolve_orchestrator_profile(cfg: dict) -> str:
         return "default"
 
 
+def _is_auto_assignable(name: str) -> bool:
+    """True unless ``name``'s profile.yaml opts out of kanban auto-routing.
+
+    Unknown/unreadable profiles are treated as assignable, matching the
+    permissive default in :func:`profiles.read_profile_meta`.
+    """
+    if not name:
+        return True
+    try:
+        meta = profiles_mod.read_profile_meta(
+            profiles_mod.get_profile_dir(name)
+        )
+    except Exception:
+        return True
+    return bool(meta.get("kanban_auto_assignable", True))
+
+
 def _resolve_default_assignee(cfg: dict) -> str:
-    """Resolve which profile catches child tasks the orchestrator can't route."""
+    """Resolve which profile catches child tasks the orchestrator can't route.
+
+    The fallback must never land on a profile that opted out of auto-routing.
+    ``get_active_profile_name()`` is the process's OWN profile, so on a
+    dedicated locked-down gateway (e.g. an external-facing one running the
+    auto-decomposer) this would otherwise hand it the very work
+    ``kanban_auto_assignable: false`` exists to keep away — silently
+    re-opening the hole _build_roster() just closed.
+    """
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     explicit = (kanban_cfg.get("default_assignee") or "").strip()
     if explicit:
         try:
-            if profiles_mod.profile_exists(explicit):
+            if profiles_mod.profile_exists(explicit) and _is_auto_assignable(explicit):
                 return explicit
         except Exception:
             pass
     try:
-        return profiles_mod.get_active_profile_name() or "default"
+        active = profiles_mod.get_active_profile_name() or "default"
     except Exception:
         return "default"
+    return active if _is_auto_assignable(active) else "default"
 
 
 def _build_roster() -> tuple[list[dict], set[str]]:
@@ -229,6 +255,17 @@ def _build_roster() -> tuple[list[dict], set[str]]:
         logger.warning("decompose: failed to list profiles: %s", exc)
         return roster, valid
     for p in all_profiles:
+        # A profile can opt itself out of auto-routing via
+        # ``kanban_auto_assignable: false`` in its own profile.yaml. Skip it
+        # in BOTH the prompt roster and the valid-set: leaving it in the
+        # valid-set would let an LLM-chosen assignee survive
+        # _normalize_assignee_choice() even though it was never offered.
+        if not getattr(p, "kanban_auto_assignable", True):
+            logger.debug(
+                "decompose: profile %s is not auto-assignable; excluded from roster",
+                p.name,
+            )
+            continue
         desc = (p.description or "").strip()
         roster.append({
             "name": p.name,

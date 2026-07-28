@@ -349,3 +349,154 @@ def test_decompose_no_aux_client_configured(kanban_home):
     assert outcome.ok is False
     # call_llm's no-provider RuntimeError surfaces via the LLM-error branch.
     assert "LLM error" in outcome.reason
+
+
+# ---------------------------------------------------------------------------
+# kanban_auto_assignable — profiles that opt out of auto-routing
+#
+# A locked-down profile (e.g. an external-facing worker) must never be handed
+# work by the auto-decomposer. The opt-out lives in the profile's OWN
+# profile.yaml so the policy travels with the profile instead of depending on
+# a central exclude-list somebody has to remember to update.
+# ---------------------------------------------------------------------------
+
+
+def _patch_list_profiles_with_flags(specs: list[tuple[str, bool]]):
+    """Like _patch_list_profiles, but each entry is (name, auto_assignable)."""
+    from types import SimpleNamespace
+    names = [n for n, _ in specs]
+    fake_profiles = [
+        SimpleNamespace(
+            name=n, is_default=(i == 0), description=f"desc for {n}",
+            description_auto=False, model="m", provider="p", skill_count=1,
+            kanban_auto_assignable=flag,
+        )
+        for i, (n, flag) in enumerate(specs)
+    ]
+    flag_by_name = dict(specs)
+    return [
+        patch("hermes_cli.profiles.list_profiles", return_value=fake_profiles),
+        patch("hermes_cli.profiles.profile_exists", side_effect=lambda x: x in names),
+        patch("hermes_cli.profiles.get_active_profile_name",
+              return_value=names[0] if names else "default"),
+        # _is_auto_assignable reads profile.yaml directly rather than going
+        # through list_profiles, so it needs its own stub.
+        patch("hermes_cli.profiles.read_profile_meta",
+              side_effect=lambda d: {
+                  "description": "", "description_auto": False,
+                  "kanban_auto_assignable": flag_by_name.get(
+                      Path(d).name, True),
+              }),
+        patch("hermes_cli.profiles.get_profile_dir", side_effect=Path),
+    ]
+
+
+def test_roster_excludes_profiles_that_opted_out():
+    patches = _patch_list_profiles_with_flags([
+        ("orchestrator", True),
+        ("engineer", True),
+        ("locked_down_worker", False),
+    ])
+    for p in patches:
+        p.start()
+    try:
+        roster, valid = decomp._build_roster()
+    finally:
+        for p in patches:
+            p.stop()
+
+    roster_names = {e["name"] for e in roster}
+    # Absent from the prompt roster...
+    assert "locked_down_worker" not in roster_names
+    # ...AND from the valid-set, or _normalize_assignee_choice() would let an
+    # LLM-invented assignee through even though it was never offered.
+    assert "locked_down_worker" not in valid
+    assert roster_names == {"orchestrator", "engineer"}
+    assert valid == {"orchestrator", "engineer"}
+
+
+def test_decompose_rewrites_assignee_that_opted_out(kanban_home):
+    """End-to-end: even if the LLM names the excluded profile, it can't land."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="pull the numbers", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single task",
+        "title": "Pull the numbers",
+        "body": "Read-only query.",
+        "assignee": "locked_down_worker",
+    })
+
+    patches = _patch_list_profiles_with_flags([
+        ("orchestrator", True),
+        ("locked_down_worker", False),
+    ])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.assignee != "locked_down_worker"
+    assert task.assignee == "orchestrator"
+
+
+def test_default_assignee_falls_back_when_active_profile_opted_out():
+    """The fallback must not re-open the hole _build_roster() closed.
+
+    ``get_active_profile_name()`` is the running process's own profile. On a
+    dedicated locked-down gateway that runs the auto-decomposer, the naive
+    fallback would assign unroutable work straight back to itself.
+    """
+    patches = _patch_list_profiles_with_flags([
+        ("locked_down_worker", False),
+        ("orchestrator", True),
+    ])
+    for p in patches:
+        p.start()
+    try:
+        resolved = decomp._resolve_default_assignee({})
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert resolved == "default"
+
+
+def test_explicit_default_assignee_rejected_when_it_opted_out():
+    patches = _patch_list_profiles_with_flags([
+        ("orchestrator", True),
+        ("locked_down_worker", False),
+    ])
+    for p in patches:
+        p.start()
+    try:
+        resolved = decomp._resolve_default_assignee(
+            {"kanban": {"default_assignee": "locked_down_worker"}}
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert resolved != "locked_down_worker"
+    assert resolved == "orchestrator"
+
+
+def test_profiles_without_the_flag_stay_assignable(kanban_home):
+    """Backward compatibility: silence means routable, as before."""
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        roster, valid = decomp._build_roster()
+    finally:
+        for p in patches:
+            p.stop()
+    assert valid == {"orchestrator", "engineer"}

@@ -650,6 +650,11 @@ class ProfileInfo:
     # surfaces a "review" badge in this case so the user can edit or
     # accept.
     description_auto: bool = False
+    # False when ``profile.yaml`` sets ``kanban_auto_assignable: false``.
+    # Such a profile is excluded from the kanban decomposer's roster, so
+    # auto-decompose can never route work to it. Defaults True so existing
+    # profiles and any other ``ProfileInfo`` construction site keep working.
+    kanban_auto_assignable: bool = True
 
 
 def _read_distribution_meta(profile_dir: Path) -> tuple:
@@ -812,28 +817,43 @@ def _profile_yaml_path(profile_dir: Path) -> Path:
     return profile_dir / "profile.yaml"
 
 
+_PROFILE_META_DEFAULTS = {
+    "description": "",
+    "description_auto": False,
+    # Opt-out flag: when False this profile is never offered to the kanban
+    # decomposer as a routing target. Declared in the profile's OWN
+    # profile.yaml rather than a central exclude-list so a new locked-down
+    # profile carries its own policy instead of relying on someone
+    # remembering to add it somewhere else. Defaults True — a profile that
+    # says nothing stays routable, which is the pre-existing behavior.
+    "kanban_auto_assignable": True,
+}
+
+
 def read_profile_meta(profile_dir: Path) -> dict:
     """Read ``<profile_dir>/profile.yaml`` and return a dict.
 
-    Returns ``{"description": "", "description_auto": False}`` when the
-    file is missing or unreadable. Never raises — a corrupt
-    profile.yaml on an unrelated profile must not break
-    ``hermes profile list``.
+    Returns :data:`_PROFILE_META_DEFAULTS` when the file is missing or
+    unreadable. Never raises — a corrupt profile.yaml on an unrelated
+    profile must not break ``hermes profile list``.
     """
     path = _profile_yaml_path(profile_dir)
     if not path.is_file():
-        return {"description": "", "description_auto": False}
+        return dict(_PROFILE_META_DEFAULTS)
     try:
         import yaml
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
     except Exception:
-        return {"description": "", "description_auto": False}
+        return dict(_PROFILE_META_DEFAULTS)
     if not isinstance(data, dict):
-        return {"description": "", "description_auto": False}
+        return dict(_PROFILE_META_DEFAULTS)
     return {
         "description": str(data.get("description") or "").strip(),
         "description_auto": bool(data.get("description_auto", False)),
+        "kanban_auto_assignable": bool(
+            data.get("kanban_auto_assignable", True)
+        ),
     }
 
 
@@ -899,6 +919,7 @@ def list_profiles() -> List[ProfileInfo]:
             distribution_source=dist_source,
             description=meta.get("description", ""),
             description_auto=meta.get("description_auto", False),
+            kanban_auto_assignable=meta.get("kanban_auto_assignable", True),
         ))
 
     # Named profiles
@@ -941,6 +962,9 @@ def list_profiles() -> List[ProfileInfo]:
                 distribution_source=dist_source,
                 description=meta.get("description", ""),
                 description_auto=meta.get("description_auto", False),
+                kanban_auto_assignable=meta.get(
+                    "kanban_auto_assignable", True
+                ),
             ))
 
     return profiles

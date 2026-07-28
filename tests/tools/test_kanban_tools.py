@@ -3064,3 +3064,54 @@ def test_worker_env_not_restricted(monkeypatch, tmp_path):
     assert kt._restricted_creator() is None
     d = json.loads(kt._handle_show({"task_id": foreign}))
     assert d.get("task", {}).get("id") == foreign
+
+
+# ---------------------------------------------------------------------------
+# assignee / triage interaction
+#
+# A triage task is unrouted by definition — the decomposer assigns it when it
+# fans out. Requiring an assignee for one forced callers to invent a value,
+# and on 2026-07-28 an orchestrator supplied assignee="triage": the row landed
+# in 'ready' owned by a non-existent profile, so nothing decomposed it and
+# nothing dispatched it. It sat silently.
+# ---------------------------------------------------------------------------
+
+def test_status_name_guard_matches_the_real_status_vocabulary():
+    """The guard set is duplicated from kanban_db — fail if it drifts."""
+    from tools.kanban_tools import _STATUS_NAMES_NOT_ASSIGNEES
+    from hermes_cli.kanban_db import VALID_STATUSES
+    assert _STATUS_NAMES_NOT_ASSIGNEES == VALID_STATUSES
+
+
+@pytest.mark.parametrize("bad", ["triage", "todo", "ready", "done", "TRIAGE", " triage "])
+def test_create_rejects_status_name_as_assignee(worker_env, bad):
+    from tools import kanban_tools as kt
+    out = kt._handle_create({"title": "x", "assignee": bad, "parents": [worker_env]})
+    d = json.loads(out)
+    assert d.get("ok") is not True
+    err = json.dumps(d)
+    assert "STATUS" in err and "triage=true" in err
+
+
+def test_create_allows_missing_assignee_when_triage(worker_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_create({"title": "unrouted triage task", "triage": True})
+    d = json.loads(out)
+    assert d["ok"] is True, out
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        t = kb.get_task(conn, d["task_id"])
+        assert t.status == "triage"
+        # Must be a real NULL, not the string "None".
+        assert t.assignee in (None, ""), repr(t.assignee)
+    finally:
+        conn.close()
+
+
+def test_create_still_requires_assignee_without_triage(worker_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_create({"title": "x", "parents": [worker_env]})
+    d = json.loads(out)
+    assert d.get("ok") is not True
+    assert "assignee is required" in json.dumps(d)

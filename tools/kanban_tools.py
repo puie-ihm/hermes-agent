@@ -48,6 +48,21 @@ logger = logging.getLogger(__name__)
 KANBAN_LIST_DEFAULT_LIMIT = 50
 KANBAN_LIST_MAX_LIMIT = 200
 
+# Status names are never valid assignees. A model that means "put this in the
+# triage column" reaches for assignee="triage" instead of the triage boolean;
+# the row then lands in 'ready' owned by a profile that does not exist, so it
+# is neither decomposed nor dispatched and sits silently. Rejecting the whole
+# status vocabulary is safe: no profile may be named after a status.
+#
+# Duplicated from kanban_db.VALID_STATUSES rather than imported because
+# kanban_db is imported lazily here (circular-import avoidance). A test
+# asserts the two stay equal, so drift fails CI instead of silently
+# re-opening the hole.
+_STATUS_NAMES_NOT_ASSIGNEES = frozenset({
+    "triage", "todo", "scheduled", "ready", "running",
+    "blocked", "review", "done", "archived",
+})
+
 
 def _profile_has_kanban_toolset() -> bool:
     # Uses load_config() which has mtime-based caching, so this adds
@@ -1155,11 +1170,29 @@ def _handle_create(args: dict, **kw) -> str:
     title = args.get("title")
     if not title or not str(title).strip():
         return tool_error("title is required")
+    # Parsed up here because whether ``assignee`` is required depends on it.
+    triage, bool_error = _parse_bool_arg(args, "triage")
+    if bool_error:
+        return tool_error(bool_error)
+
     assignee = args.get("assignee")
-    if not assignee:
+    if assignee and str(assignee).strip().lower() in _STATUS_NAMES_NOT_ASSIGNEES:
+        # Observed 2026-07-28: an orchestrator told to file a triage task, but
+        # unable to omit assignee because it was mandatory, passed
+        # assignee="triage". That lands in 'ready' assigned to a profile that
+        # does not exist — nothing decomposes it and nothing runs it, so the
+        # task silently sits forever. Fail loudly instead.
+        return tool_error(
+            f"kanban_create: {str(assignee).strip()!r} is a task STATUS, not a "
+            f"profile name. To put a task in the triage column, pass the "
+            f"boolean parameter triage=true and omit assignee."
+        )
+    if not assignee and not triage:
         return tool_error(
             "assignee is required — name the profile that should execute this "
-            "task (the dispatcher will only spawn tasks with an assignee)"
+            "task (the dispatcher will only spawn tasks with an assignee). "
+            "The one exception is triage=true: a triage task is unrouted by "
+            "definition, and the decomposer assigns it when it fans out."
         )
     # Layer-1 assignee allowlist (hard-pin): a prompt-injected creator must not
     # be able to route work to an off-limits worker. Enforced against the
@@ -1205,9 +1238,8 @@ def _handle_create(args: dict, **kw) -> str:
     _inherit_workspace = workspace_kind is None and workspace_path is None
     if workspace_kind is None:
         workspace_kind = "scratch"
-    triage, bool_error = _parse_bool_arg(args, "triage")
-    if bool_error:
-        return tool_error(bool_error)
+    # ``triage`` is parsed at the top of this function — it decides whether
+    # ``assignee`` is required.
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
@@ -1264,7 +1296,9 @@ def _handle_create(args: dict, **kw) -> str:
                 conn,
                 title=str(title).strip(),
                 body=body,
-                assignee=str(assignee),
+                # None (triage task) must stay None — str() would store the
+                # literal "None" as the assignee.
+                assignee=str(assignee) if assignee else None,
                 parents=tuple(parents),
                 tenant=tenant,
                 priority=int(priority) if priority is not None else 0,

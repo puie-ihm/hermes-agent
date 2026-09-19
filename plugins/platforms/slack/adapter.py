@@ -3584,7 +3584,9 @@ class SlackAdapter(BasePlatformAdapter):
                 # stay silent rather than answer for the mentioned person.
                 # Circuit-breaker: cap consecutive bot-originated follow-up
                 # turns per thread to stop runaway agent-to-agent ack loops.
-                _is_bot_msg = bool(event.get("bot_id") or event.get("subtype") == "bot_message")
+                # See _is_bot_authored_followup: a bare bot_id check miscounts
+                # humans who post through an app user token.
+                _is_bot_msg = self._is_bot_authored_followup(event)
                 _cb = getattr(self, "_followup_bot_turns", None)
                 if _cb is None:
                     _cb = self._followup_bot_turns = {}
@@ -5084,6 +5086,39 @@ class SlackAdapter(BasePlatformAdapter):
         if configured is not None:
             return str(configured).lower()
         return os.getenv("SLACK_THREAD_FOLLOWUP_MODE", "off").lower()
+
+    def _slack_known_human_ids(self) -> set:
+        """Human user IDs this bot serves, from the channel and DM allowlists."""
+        ids: set = set()
+        for var in ("SLACK_ALLOWED_USERS", "SLACK_DM_ALLOWED_USERS"):
+            raw = os.getenv(var, "") or ""
+            ids.update(part.strip() for part in raw.split(",") if part.strip())
+        return ids
+
+    def _is_bot_authored_followup(self, event: dict) -> bool:
+        """True when a thread follow-up was authored by a bot/app, not by a human.
+
+        ``bot_id`` is NOT proof that a bot wrote the message. Slack stamps it on
+        messages posted with an app's *user* token as well, and those carry the
+        human in ``user`` too. Measured 2026-09-19 in #agent-monitoring: a
+        user-token post arrived as ``user=U028TNBPA22 + bot_id=B0B1T07L1NG +
+        app_id=<this same app>``, the circuit-breaker counted it as a bot turn,
+        and the thread went silent on the fourth message -- with no error, just
+        a bot that stops answering. A sender we know as a human is never bot
+        traffic, whatever Slack stamped on the envelope.
+        """
+        if event.get("subtype") == "bot_message":
+            return True
+        if not event.get("bot_id"):
+            return False
+        user_id = str(event.get("user") or "").strip()
+        if not user_id:
+            return True
+        if user_id in self._slack_known_human_ids():
+            return False
+        if str(os.getenv("SLACK_ALLOW_ALL_USERS", "")).strip().lower() in {"true", "1", "yes", "on"}:
+            return False
+        return True
 
     def _in_bot_thread(self, event_thread_ts, channel_id, user_id, is_thread_reply) -> bool:
         """True when this is a thread reply in a thread the bot started, was

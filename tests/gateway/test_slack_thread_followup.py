@@ -262,3 +262,62 @@ def test_every_slack_egress_runs_the_decision_filter():
         "run.py queued-follow-up resend bypasses the sentinel filter — raw "
         "[[react:...]]/[[silent]] tokens will leak on queued follow-ups"
     )
+
+
+# ---- bot-vs-human attribution for the circuit-breaker ----------------------
+#
+# Measured regression (2026-09-19, #agent-monitoring): a message posted with an
+# app's USER token arrives with BOTH user (the human) and bot_id (the app), so a
+# bare bot_id check counted it as bot traffic. Three such messages in a thread
+# tripped the breaker and the bot went silent — no error, it just stopped
+# answering.
+
+HUMAN = "U028TNBPA22"
+# Exact envelope from the incident: user-token post, human in `user`.
+USER_TOKEN_POST = {"user": HUMAN, "bot_id": "B0B1T07L1NG", "app_id": "A0AH8JL4329", "text": "hi"}
+
+
+def test_app_user_token_post_from_known_human_is_not_bot(monkeypatch):
+    monkeypatch.setenv("SLACK_ALLOWED_USERS", f"{HUMAN},U_OTHER")
+    a = _make_adapter({"thread_followup_mode": "agent"})
+    assert a._is_bot_authored_followup(USER_TOKEN_POST) is False
+
+
+def test_unknown_sender_with_bot_id_still_counts_as_bot(monkeypatch):
+    monkeypatch.setenv("SLACK_ALLOWED_USERS", "U_SOMEONE_ELSE")
+    monkeypatch.delenv("SLACK_ALLOW_ALL_USERS", raising=False)
+    a = _make_adapter({"thread_followup_mode": "agent"})
+    assert a._is_bot_authored_followup(USER_TOKEN_POST) is True
+
+
+def test_dm_allowlist_also_marks_a_human(monkeypatch):
+    monkeypatch.delenv("SLACK_ALLOWED_USERS", raising=False)
+    monkeypatch.setenv("SLACK_DM_ALLOWED_USERS", HUMAN)
+    a = _make_adapter({"thread_followup_mode": "agent"})
+    assert a._is_bot_authored_followup(USER_TOKEN_POST) is False
+
+
+def test_allow_all_users_marks_any_bot_id_sender_human(monkeypatch):
+    monkeypatch.delenv("SLACK_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("SLACK_DM_ALLOWED_USERS", raising=False)
+    monkeypatch.setenv("SLACK_ALLOW_ALL_USERS", "true")
+    a = _make_adapter({"thread_followup_mode": "agent"})
+    assert a._is_bot_authored_followup(USER_TOKEN_POST) is False
+
+
+def test_plain_bot_message_is_bot(monkeypatch):
+    monkeypatch.setenv("SLACK_ALLOWED_USERS", HUMAN)
+    a = _make_adapter({"thread_followup_mode": "agent"})
+    assert a._is_bot_authored_followup({"bot_id": "B0AJB4857TJ", "text": "ok"}) is True
+
+
+def test_human_message_without_bot_id_is_not_bot(monkeypatch):
+    monkeypatch.delenv("SLACK_ALLOWED_USERS", raising=False)
+    a = _make_adapter({"thread_followup_mode": "agent"})
+    assert a._is_bot_authored_followup({"user": HUMAN, "text": "hi"}) is False
+
+
+def test_bot_message_subtype_is_bot_even_with_human_user(monkeypatch):
+    monkeypatch.setenv("SLACK_ALLOWED_USERS", HUMAN)
+    a = _make_adapter({"thread_followup_mode": "agent"})
+    assert a._is_bot_authored_followup({"user": HUMAN, "subtype": "bot_message"}) is True

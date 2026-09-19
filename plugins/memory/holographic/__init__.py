@@ -30,14 +30,25 @@ from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
 
-# Conversation scaffolding the Slack adapter prepends to the user's message
-# (thread context, reply quotes, author prefixes). None of it is a fact, and
-# storing it made recall answer thread-scoped questions with unrelated
+# Conversation scaffolding the Slack adapter prepends to the user's message.
+# Taken from the writers themselves, not guessed:
+#   plugins/platforms/slack/adapter.py:4680  "[thread parent] "
+#   plugins/platforms/slack/adapter.py:4710  "[Thread context — prior messages in this thread ...]"
+#   plugins/platforms/slack/adapter.py (reply) "[Replying to: \"...\"]"
+#   gateway/run.py:11555                    "[New message]"
+# plus the "[New Assistant Thread]" form seen in the store. None of it is a fact,
+# and storing it made recall answer thread-scoped questions with unrelated
 # conversations: measured 2026-09-19, 53 of 160 stored facts contained
-# "[Thread context" and 83 contained "[Replying to:", and a
-# "what did we conclude earlier" question was answered with the previous
-# morning's CAPI work because those rows matched.
-_SCAFFOLDING_MARKERS = ("[Thread context", "[Replying to:", "New Assistant Thread")
+# "[Thread context", 83 contained "[Replying to:", and a "what did we conclude
+# earlier" question was answered with the previous morning's CAPI work because
+# those rows matched.
+_SCAFFOLDING_MARKERS = (
+    "[Thread context",
+    "[Replying to:",
+    "[thread parent]",
+    "[New message]",
+    "New Assistant Thread",
+)
 _LEADING_AUTHOR_PREFIX = re.compile(r"^\s*\[[A-Z][A-Za-z0-9 .'\-]{1,24}\]\s*")
 
 

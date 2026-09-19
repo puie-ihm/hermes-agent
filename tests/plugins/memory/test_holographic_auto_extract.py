@@ -115,3 +115,13 @@ def test_assistant_messages_are_ignored():
         {"role": "assistant", "content": "I prefer to answer briefly"},
     ])
     assert store.add_fact.call_count == 0
+
+
+def test_thread_parent_prefix_is_rejected():
+    """adapter.py:4680 prefixes quoted parent messages with "[thread parent] "."""
+    assert _is_storable_memory_text("[thread parent] Puie: pair me <@U123>") is False
+
+
+def test_new_message_marker_is_rejected():
+    """run.py:11555 prefixes channel context with "[New message]"."""
+    assert _is_storable_memory_text("[New message] I prefer the CSV as a code block") is False

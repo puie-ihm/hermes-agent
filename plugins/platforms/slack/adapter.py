@@ -113,6 +113,76 @@ def check_slack_requirements() -> bool:
     return ensure_and_bind("platform.slack", _import, globals(), prompt=False)
 
 
+def _is_own_message_unfurl(att: dict, own_bot_ids: set) -> bool:
+    """True when an ``is_msg_unfurl`` attachment is one of OUR OWN messages.
+
+    Slack sets ``is_msg_unfurl`` in two different situations:
+
+    * an unfurl of a message this bot posted (echoing our own content), and
+    * a message a *human* forwards/shares into the channel.
+
+    The echo guard below used to skip every ``is_msg_unfurl`` attachment, which
+    silently discarded the second case: the agent received only the surrounding
+    mention, no forwarded text and no files, so it answered from whatever context
+    it already had. Observed 2026-09-19 in #agent-monitoring: a forwarded thread
+    (text + a screenshot) arrived as a bare mention and the bot replied about
+    unrelated in-flight work.
+
+    Only the first case is an echo, so only that one is skipped.
+    """
+    if not att.get("is_msg_unfurl"):
+        return False
+    authors = {
+        str(att.get(key) or "") for key in ("bot_id", "author_id", "user")
+    }
+    return bool(authors & {str(b) for b in own_bot_ids if b})
+
+
+def _extract_forwarded_attachment(
+    att: dict,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """Readable body + attached files from a forwarded/shared-message attachment.
+
+    Returns ``(text, files)``. The body prefers the attachment's own ``blocks``
+    (the modern composer nests forwarded ``rich_text`` there), then ``text``,
+    then ``fallback`` — ``fallback`` is skipped when it merely repeats the text,
+    since Slack's fallback is ``"[date] author: <same text>"``.
+
+    Files live at ``att["files"]``, NOT in the event's top-level ``files``
+    array, so a screenshot inside a forwarded message reached the agent only
+    once this was read.
+    """
+    parts: list[str] = []
+
+    blocks = att.get("blocks")
+    if isinstance(blocks, list) and blocks:
+        blocks_text = _extract_text_from_slack_blocks(blocks)
+        if blocks_text:
+            parts.append(blocks_text.strip())
+
+    for key in ("text", "fallback"):
+        value = (att.get(key) or "").strip()
+        if not value:
+            continue
+        # Skip when it repeats something we already have, in EITHER direction:
+        # Slack's ``fallback`` is "[date] author: <same text>", so it contains
+        # the text field rather than being contained by it.
+        if any(value in part or part in value for part in parts):
+            continue
+        parts.append(value)
+
+    body = "\n".join(parts).strip()
+
+    author = (att.get("author_subname") or att.get("author_name") or "").strip()
+    source = (att.get("channel_id") or att.get("from_url") or "").strip()
+    header_bits = [b for b in (author, source) if b]
+    if header_bits:
+        body = f"[Forwarded message from {' in '.join(header_bits)}]\n{body}"
+
+    files = att.get("files")
+    return body, ([f for f in files if isinstance(f, dict)] if isinstance(files, list) else [])
+
+
 def _extract_text_from_slack_blocks(blocks: list) -> str:
     """Extract readable text from Slack Block Kit blocks, including quoted/forwarded content.
 
@@ -3264,8 +3334,17 @@ class SlackAdapter(BasePlatformAdapter):
         # Slack places unfurled link previews in the ``attachments`` array with
         # fields like title, title_link/from_url, text, footer, and fallback.
         # Without reading these, the agent never sees shared link previews.
+        #
+        # Forwarded messages arrive in the same array, also flagged
+        # ``is_msg_unfurl``, and carry their own body and files — see
+        # ``_is_own_message_unfurl``.
+        forwarded_files: List[Dict[str, Any]] = []
         slack_attachments = event.get("attachments") or []
         if slack_attachments:
+            own_bot_ids = {
+                self._bot_user_id,
+                *self._team_bot_user_ids.values(),
+            }
             att_parts: list[str] = []
             for att in slack_attachments:
                 att_title = att.get("title", "")
@@ -3274,9 +3353,22 @@ class SlackAdapter(BasePlatformAdapter):
                 att_footer = att.get("footer", "")
                 att_fallback = att.get("fallback", "")
 
-                # Skip message-type attachments (e.g. Slack bot messages with
-                # is_msg_unfurl) to avoid echoing our own content.
+                # Skip only unfurls of OUR OWN messages (echo guard). A message
+                # a human forwarded is also flagged ``is_msg_unfurl``; dropping
+                # it left the agent with an empty message.
                 if att.get("is_msg_unfurl"):
+                    if _is_own_message_unfurl(att, own_bot_ids):
+                        continue
+                    fwd_body, fwd_files = _extract_forwarded_attachment(att)
+                    if fwd_files:
+                        forwarded_files.extend(fwd_files)
+                    if fwd_body and fwd_body not in text:
+                        att_parts.append(fwd_body)
+                    logger.debug(
+                        "Slack: forwarded attachment read (%d chars, %d file(s))",
+                        len(fwd_body),
+                        len(fwd_files),
+                    )
                     continue
 
                 # Build a readable representation.
@@ -3579,7 +3671,7 @@ class SlackAdapter(BasePlatformAdapter):
         media_urls = []
         media_types = []
         attachment_notices: List[str] = []
-        files = event.get("files", [])
+        files = list(event.get("files", [])) + forwarded_files
         for f in files:
             # Slack Connect channels return stub file objects with
             # file_access="check_file_info" and no URL fields. We must

@@ -30,6 +30,40 @@ from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
 
+# Conversation scaffolding the Slack adapter prepends to the user's message
+# (thread context, reply quotes, author prefixes). None of it is a fact, and
+# storing it made recall answer thread-scoped questions with unrelated
+# conversations: measured 2026-09-19, 53 of 160 stored facts contained
+# "[Thread context" and 83 contained "[Replying to:", and a
+# "what did we conclude earlier" question was answered with the previous
+# morning's CAPI work because those rows matched.
+_SCAFFOLDING_MARKERS = ("[Thread context", "[Replying to:", "New Assistant Thread")
+_LEADING_AUTHOR_PREFIX = re.compile(r"^\s*\[[A-Z][A-Za-z0-9 .'\-]{1,24}\]\s*")
+
+
+def _strip_leading_author_prefix(text: str) -> str:
+    """Drop caller-added ``[Agung]``-style prefixes (repeated ones included)."""
+    previous = None
+    while previous != text:
+        previous = text
+        text = _LEADING_AUTHOR_PREFIX.sub("", text, count=1)
+    return text.strip()
+
+
+def _is_storable_memory_text(text: str) -> bool:
+    """False when the text is conversation scaffolding rather than a statement.
+
+    Scaffolding is *rejected*, not parsed: the thread-context block is
+    multi-line and the real message follows it, so extracting the user's part
+    reliably is not possible from the stored string. A false negative (one lost
+    preference) is much cheaper than the false positive we measured.
+    """
+    if not text or len(text) < 10:
+        return False
+    lowered = text.lower()
+    return not any(marker.lower() in lowered for marker in _SCAFFOLDING_MARKERS)
+
+
 
 # ---------------------------------------------------------------------------
 # Tool schemas (unchanged from original PR)
@@ -368,8 +402,13 @@ class HolographicMemoryProvider(MemoryProvider):
     # -- Auto-extraction (on_session_end) ------------------------------------
 
     def _auto_extract_facts(self, messages: list) -> None:
+        # NOTE ``want``/``need`` are deliberately absent: "I need to know my total
+        # profits" / "I want to create new labels" are work requests, and tagging
+        # them ``user_pref`` filled the store with them (117 of 160 facts were
+        # user_pref, most of them requests). A real preference says prefer/like/
+        # always/never or names a favourite/default.
         _PREF_PATTERNS = [
-            re.compile(r'\bI\s+(?:prefer|like|love|use|want|need)\s+(.+)', re.IGNORECASE),
+            re.compile(r'\bI\s+(?:prefer|like|love|use)\s+(.+)', re.IGNORECASE),
             re.compile(r'\bmy\s+(?:favorite|preferred|default)\s+\w+\s+is\s+(.+)', re.IGNORECASE),
             re.compile(r'\bI\s+(?:always|never|usually)\s+(.+)', re.IGNORECASE),
         ]
@@ -384,6 +423,9 @@ class HolographicMemoryProvider(MemoryProvider):
                 continue
             content = msg.get("content", "")
             if not isinstance(content, str) or len(content) < 10:
+                continue
+            content = _strip_leading_author_prefix(content)
+            if not _is_storable_memory_text(content):
                 continue
 
             for pattern in _PREF_PATTERNS:

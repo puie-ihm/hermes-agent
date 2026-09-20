@@ -3602,6 +3602,49 @@ class SlackAdapter(BasePlatformAdapter):
                             _cb.pop(_old, None)
                 else:
                     _cb.pop(event_thread_ts, None)  # human turn resets the counter
+
+                # Jev triage (fork, LaHermes only): a typed classifier decides
+                # silent/react/reply before we spend an LLM turn on it. A
+                # high-confidence silent/react returns here, so the turn never
+                # runs; everything else falls through to the existing model
+                # triage, which is also what happens when Jev is disabled, slow,
+                # erroring or unsure (agent/jev_triage.py is fail-open by
+                # design). Bot-authored traffic keeps the model path so the
+                # ack-loop guard above stays exercised.
+                if not _is_bot_msg:
+                    try:
+                        from agent.jev_triage import decide_followup, is_enabled as _jev_enabled
+
+                        if _jev_enabled():
+                            _jev_ctx = ""
+                            with contextlib.suppress(Exception):
+                                _jev_ctx = await self._fetch_thread_context(
+                                    channel_id, event_thread_ts, ts,
+                                    team_id=team_id or "", limit=6,
+                                )
+                            _jev = await asyncio.to_thread(
+                                decide_followup, text,
+                                thread_context=_jev_ctx or "",
+                            )
+                            logger.info(
+                                "[Slack] jev triage chat=%s ts=%s action=%s "
+                                "confidence=%s latency=%dms tokens=%s (%s)",
+                                channel_id, ts, _jev.action, _jev.confidence,
+                                _jev.latency_ms, _jev.tokens, _jev.reason,
+                            )
+                            if _jev.action == "silent":
+                                return
+                            if _jev.action == "react":
+                                from agent.jev_triage import react_emoji as _jev_emoji
+
+                                if self._reactions_enabled():
+                                    await self._add_reaction(
+                                        channel_id, ts, _jev_emoji(), team_id or ""
+                                    )
+                                return
+                    except Exception:
+                        logger.debug("[Slack] jev triage failed; using model path", exc_info=True)
+
                 _followup_decision = True
             elif self._slack_strict_mention():
                 return  # Strict mode: not mentioned, not a bot thread → ignore

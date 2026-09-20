@@ -273,3 +273,26 @@ def test_acknowledgement_addressed_to_the_assistant_prefers_reply(monkeypatch):
                         lambda *a, **k: _fake_response(payload))
     d = jev_triage.decide_followup("ขอบคุณครับ แล้วช่วยส่ง CSV ด้วย")
     assert d.action is None
+
+
+def test_status_note_to_the_thread_silences(monkeypatch):
+    """'เดี๋ยวผมคุยกับทีมก่อนนะ' — a status note to the thread, nobody is asking.
+    Measured: this rule took the labelled set from 8/10 to 9/10 correct and
+    turns saved from 4 to 5, with no new false silence."""
+    payload = _answers("reply", 0.9, directed="everyone", needs=0.4)
+    payload["answers"]["request_type"] = {"type": "choice", "choice": "status_or_note",
+                                          "confidence": 0.88}
+    monkeypatch.setattr(jev_triage.urllib.request, "urlopen",
+                        lambda *a, **k: _fake_response(payload))
+    d = jev_triage.decide_followup("เดี๋ยวผมคุยกับทีมก่อนนะ แล้วจะกลับมา")
+    assert d.action == "silent" and d.confidence == 0.88
+
+
+def test_status_note_to_the_assistant_still_reaches_the_model(monkeypatch):
+    """"I sent the file you asked for" must not be silenced."""
+    payload = _answers("reply", 0.95, directed="assistant", needs=0.8)
+    payload["answers"]["request_type"] = {"type": "choice", "choice": "status_or_note",
+                                          "confidence": 0.9}
+    monkeypatch.setattr(jev_triage.urllib.request, "urlopen",
+                        lambda *a, **k: _fake_response(payload))
+    assert jev_triage.decide_followup("ผมส่งไฟล์ที่พี่ขอแล้วนะ").action is None

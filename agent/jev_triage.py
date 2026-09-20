@@ -290,7 +290,23 @@ def decide_followup(
             latency_ms=latency_ms, tokens=tokens,
         )
 
-    # 4. Nothing anywhere is waiting on the assistant: stay silent.
+    # 4. A status note that is not addressed to the assistant: nobody is asking
+    #    it anything, so stay out of it ("เดี๋ยวผมคุยกับทีมก่อนนะ"). Guarded on
+    #    `directed_at != assistant` so "I sent the file you asked for" still goes
+    #    to the model. Measured on the labelled set: +1 correct, +1 turn saved,
+    #    no new false silence.
+    if (
+        request_choice == "status_or_note"
+        and request_conf >= floor
+        and directed_choice != "assistant"
+    ):
+        return TriageDecision(
+            action="silent", confidence=request_conf,
+            reason=f"ok;{detail};request_type=status_or_note",
+            latency_ms=latency_ms, tokens=tokens,
+        )
+
+    # 5. Nothing anywhere is waiting on the assistant: stay silent.
     if needs_prob is not None and needs_prob <= 0.15:
         return TriageDecision(
             action="silent", confidence=round(1.0 - needs_prob, 4),

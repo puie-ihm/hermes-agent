@@ -3219,25 +3219,11 @@ class SlackAdapter(BasePlatformAdapter):
         if event_ts and self._dedup.is_duplicate(event_ts):
             return
 
-        # Staleness guard: drop events whose Slack-side ts is older than 60s.
-        # Chat is real-time — by the time a redelivery arrives ~5–6 min later
-        # (Socket Mode reconnect replay), the user has moved on. Re-processing
-        # would duplicate side effects (tool calls, commits, PRs, outbound
-        # messages) which is more damaging than a missed message the user can
-        # just retype. Normal delivery latency is sub-second, so 60s is a
-        # generous floor that only trips on retries.
-        if event_ts:
-            try:
-                msg_age = time.time() - float(event_ts)
-                if msg_age > 60:
-                    logger.info(
-                        "[Slack] dropping stale event ts=%s age=%.0fs",
-                        event_ts,
-                        msg_age,
-                    )
-                    return
-            except (ValueError, TypeError):
-                pass
+        # Staleness guard — OPT-IN via SLACK_STALE_EVENT_TTL_SECONDS, default OFF.
+        # See _drop_stale_event for why the unconditional 60s floor it replaced
+        # was wrong (it silently ate a restart backlog on 2026-09-20).
+        if self._drop_stale_event(event_ts):
+            return
 
         # Bot message filtering (SLACK_ALLOW_BOTS / config allow_bots):
         #   "none"     — ignore all bot messages (default, backward-compatible)
@@ -5131,6 +5117,33 @@ class SlackAdapter(BasePlatformAdapter):
             "yes",
             "on",
         }
+
+    def _drop_stale_event(self, event_ts) -> bool:
+        """True when the event is older than SLACK_STALE_EVENT_TTL_SECONDS (opt-in).
+
+        An unconditional wall-clock floor is the wrong shape and was on by
+        default: measured 2026-09-20, a gateway restart at 13:16:36 reconnected to
+        Slack at 13:18:11 (95s of startup), and four real messages queued in that
+        window were delivered at 13:18:49 with a Slack-side ts 67-81s old — all
+        four were dropped by this guard: no reply, no error, nothing in the
+        channel. A restart always produces that backlog, so the guard is opt-in
+        per deployment: set SLACK_STALE_EVENT_TTL_SECONDS=60 to enable it for
+        genuine Socket Mode reconnect replay.
+        """
+        try:
+            ttl = float(os.getenv("SLACK_STALE_EVENT_TTL_SECONDS", "0") or 0)
+        except ValueError:
+            ttl = 0.0
+        if not event_ts or ttl <= 0:
+            return False
+        try:
+            age = time.time() - float(event_ts)
+        except (ValueError, TypeError):
+            return False
+        if age > ttl:
+            logger.info("[Slack] dropping stale event ts=%s age=%.0fs", event_ts, age)
+            return True
+        return False
 
     def _thread_followup_mode(self) -> str:
         """Thread follow-up mode: 'agent' lets the model decide reply/react/silent

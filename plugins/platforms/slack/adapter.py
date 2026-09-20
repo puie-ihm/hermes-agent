@@ -3643,7 +3643,10 @@ class SlackAdapter(BasePlatformAdapter):
                                     )
                                 return
                     except Exception:
-                        logger.debug("[Slack] jev triage failed; using model path", exc_info=True)
+                        # warning, not debug: a swallowed failure here silently
+                        # disabled the Jev path once already, and nothing in the
+                        # log showed it.
+                        logger.warning("[Slack] jev triage failed; using model path", exc_info=True)
 
                 _followup_decision = True
             elif self._slack_strict_mention():

@@ -172,3 +172,40 @@ def test_request_uses_pinned_model_and_rubric(monkeypatch):
     assert seen["body"]["state"]["thread_context"].startswith("Puie:")
     assert "other" in seen["body"]["questions"]["response"]["criteria"]  # escape hatch
     assert seen["ua"] == "ihm-lahermes/1.0"
+
+
+# ---- credential resolution -------------------------------------------------
+
+def test_key_is_read_from_the_secret_scope(monkeypatch):
+    """In the multiplexed gateway os.environ does not hold credentials; the
+    per-turn secret scope does. Reading the environment directly made
+    is_enabled() False in the running gateway (Jev silently skipped)."""
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    import agent.secret_scope as scope
+
+    monkeypatch.setattr(scope, "get_secret", lambda name, default=None: "apik_from_scope")
+    assert jev_triage.is_enabled() is True
+
+
+def test_scope_value_is_used_for_auth(monkeypatch):
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    import agent.secret_scope as scope
+
+    monkeypatch.setattr(scope, "get_secret", lambda name, default=None: "apik_from_scope")
+    seen = {}
+
+    def _urlopen(request, **kwargs):
+        seen["auth"] = request.get_header("Authorization")
+        return _fake_response(_answers("silent", 0.9))
+
+    monkeypatch.setattr(jev_triage.urllib.request, "urlopen", _urlopen)
+    jev_triage.decide_followup("x")
+    assert seen["auth"] == "Bearer apik_from_scope"
+
+
+def test_env_still_works_as_a_fallback(monkeypatch):
+    import agent.secret_scope as scope
+
+    monkeypatch.setattr(scope, "get_secret", lambda name, default=None: None)
+    monkeypatch.setenv("TYPESAFE_API_KEY", "apik_from_env")
+    assert jev_triage.is_enabled() is True

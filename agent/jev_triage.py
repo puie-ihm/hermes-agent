@@ -90,6 +90,30 @@ class TriageDecision:
     tokens: Optional[int] = None
 
 
+def _api_key() -> str:
+    """Resolve the TypeSafe key the way the rest of the fork resolves credentials.
+
+    ``os.environ`` is NOT enough here. The gateway multiplexes profiles and
+    installs a per-turn secret scope; ``agent.secret_scope.get_secret`` documents
+    that in that mode the scope is authoritative and ``os.environ`` is not
+    consulted, because it may hold another profile's value (the framework also
+    withholds credentials from ``os.environ`` for the same reason). Reading the
+    environment directly made ``is_enabled()`` return False in the running
+    gateway while it returned True in a shell that had loaded ``~/.hermes/.env``
+    itself -- the Jev path was silently skipped and every follow-up kept running
+    a full LLM turn, with no log line to show for it.
+    """
+    try:
+        from agent.secret_scope import get_secret
+
+        value = get_secret("TYPESAFE_API_KEY")
+        if value:
+            return str(value).strip()
+    except Exception:
+        pass
+    return (os.environ.get("TYPESAFE_API_KEY") or "").strip()
+
+
 def _env_truthy(name: str, default: bool = True) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -99,7 +123,7 @@ def _env_truthy(name: str, default: bool = True) -> bool:
 
 def is_enabled() -> bool:
     """True only when a key is present and the profile has not disabled it."""
-    if not os.getenv("TYPESAFE_API_KEY", "").strip():
+    if not _api_key():
         return False
     return _env_truthy("JEV_TRIAGE_ENABLED", default=True) and not os.getenv(
         "JEV_TRIAGE_DISABLED", ""
@@ -150,7 +174,7 @@ def decide_followup(
         JEV_ENDPOINT,
         data=body,
         headers={
-            "Authorization": "Bearer " + os.environ["TYPESAFE_API_KEY"].strip(),
+            "Authorization": "Bearer " + _api_key(),
             "content-type": "application/json",
             # TypeSafe's edge rejects generic SDK user agents.
             "User-Agent": "ihm-lahermes/1.0",

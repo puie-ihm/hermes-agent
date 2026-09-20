@@ -3617,11 +3617,19 @@ class SlackAdapter(BasePlatformAdapter):
 
                         if _jev_enabled():
                             _jev_ctx = ""
-                            with contextlib.suppress(Exception):
+                            try:
                                 _jev_ctx = await self._fetch_thread_context(
                                     channel_id, event_thread_ts, ts,
                                     team_id=team_id or "", limit=6,
                                 )
+                            except Exception:
+                                # Context is an accuracy nicety, not a gate: a
+                                # failed fetch must not disable the decision.
+                                # Deliberately not contextlib.suppress — this
+                                # module does not import contextlib, and the
+                                # NameError it raised here was swallowed as a
+                                # triage failure instead of a code bug.
+                                _jev_ctx = ""
                             _jev = await asyncio.to_thread(
                                 decide_followup, text,
                                 thread_context=_jev_ctx or "",

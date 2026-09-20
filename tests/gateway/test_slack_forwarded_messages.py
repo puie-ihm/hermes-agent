@@ -140,3 +140,85 @@ def test_other_bots_unfurl_is_kept():
     """A forwarded message from another bot is still content, not our echo."""
     att = {"is_msg_unfurl": True, "bot_id": "B0BMJ5YKV7B", "text": "revenue figures"}
     assert _is_own_message_unfurl(att, {OUR_BOT}) is False
+
+
+# ---------------------------------------------------------------------------
+# End-to-end through the real inbound handler: what the AGENT receives
+# ---------------------------------------------------------------------------
+
+import os  # noqa: E402
+import time  # noqa: E402
+from unittest.mock import AsyncMock, MagicMock, patch  # noqa: E402
+
+import pytest  # noqa: E402
+
+
+def _make_adapter():
+    from gateway.config import PlatformConfig
+    from plugins.platforms.slack.adapter import SlackAdapter
+
+    a = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake-token"))
+    a._app = MagicMock()
+    a._app.client = AsyncMock()
+    a._bot_user_id = OUR_BOT
+    a._team_bot_user_ids = {"T_TEAM": OUR_BOT}
+    a._running = True
+    a.handle_message = AsyncMock()
+    return a
+
+
+def _forwarded_event():
+    # Fresh ts: the adapter drops events older than its staleness window, and
+    # the real payload's ts is historical by the time tests run.
+    ts = f"{time.time():.6f}"
+    return {
+        "text": f"<@{OUR_BOT}> <@U0BMA0XUH6F>",
+        "user": "U028TNBPA22",
+        "channel": "C0AR4A8S6DP",
+        "channel_type": "channel",
+        "ts": ts,
+        "thread_ts": ts,
+        "files": [],
+        "blocks": [],
+        "attachments": [FORWARDED_ATTACHMENT],
+    }
+
+
+@pytest.mark.asyncio
+async def test_agent_receives_forwarded_text_and_nested_image(tmp_path):
+    """The whole point: forwarded body AND its screenshot reach the agent."""
+    adapter = _make_adapter()
+    cached_png = tmp_path / "forwarded.png"
+    cached_png.write_bytes(b"\x89PNG\r\n\x1a\n fake")
+
+    with patch.object(
+        adapter, "_download_slack_file", new_callable=AsyncMock
+    ) as dl:
+        dl.return_value = str(cached_png)
+        await adapter._handle_slack_message(_forwarded_event())
+
+    msg_event = adapter.handle_message.call_args[0][0]
+
+    # (1) the forwarded text survived, with its origin labelled
+    assert "check for both web leads and inbound calls" in msg_event.text
+    assert "Forwarded message from Snow" in msg_event.text
+    assert "C05RWRCTFDK" in msg_event.text
+
+    # (2) the screenshot nested in the attachment reached the media pipeline
+    assert msg_event.media_types == ["image/png"]
+    assert msg_event.media_urls == [str(cached_png)]
+    # ...downloaded from the attachment's file, which Slack only exposes there
+    assert "F0C31KPM4F6" in dl.call_args[0][0]
+
+
+@pytest.mark.asyncio
+async def test_own_message_unfurl_is_not_injected():
+    """Echo guard intact: our own unfurled message contributes no content."""
+    adapter = _make_adapter()
+    event = _forwarded_event()
+    event["attachments"] = [OWN_MESSAGE_ATTACHMENT]
+
+    await adapter._handle_slack_message(event)
+
+    text = adapter.handle_message.call_args[0][0].text
+    assert "Cronjob Response" not in text

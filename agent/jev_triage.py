@@ -42,40 +42,75 @@ DEFAULT_REACT_EMOJI = "+1"
 
 QUESTION_ID = "response"
 
+# Three independent questions over the same state, combined in code. TypeSafe's
+# guidance is to ask one judgment per question and compose the answers yourself
+# ("speculative fan-out" + "composite scoring"), and it measured better here:
+# a single how-should-you-respond question scored 60% against today's labelled
+# decisions and, worse, answered `react`/`reply` for side conversations between
+# other people -- the exact noise this was meant to remove. The fan-out version
+# scored 70% and every miss was "fall through to the model", i.e. no behaviour
+# change, so its errors are inert instead of loud.
+#
 # Rubric notes, from the cases that actually went wrong on 2026-09-19:
 #   * "LaHermes ช่วยบอกอีกที..." -> reply (addressed by name)
-#   * "ให้พี่ปุ้ยช่วยเช็คให้หน่อย" -> silent (addressed to another person by name)
-#   * "ขอบคุณครับ" / "รับทราบ ขอบคุณครับ" -> react (acknowledgement, not a task)
-#   * "เดี๋ยวผมคุยกับทีมก่อนนะ" -> silent (side conversation)
-# Criteria describe situations rather than degrees, and `other` is the escape
-# hatch: without it the model is forced to pick a wrong option.
+#   * "ให้พี่ปุ้ยช่วยเช็คให้หน่อย" -> silent (a name that is not LaHermes is
+#     another person, even though the message asks that person to do something)
+#   * "ขอบคุณครับ" / "รับทราบ ขอบคุณครับ" -> react (acknowledgement)
+#   * "เดี๋ยวผมคุยกับทีมก่อนนะ" -> silent (status note, nobody is waiting)
+# Criteria describe situations rather than degrees, and every choice carries an
+# `unclear` / `other` escape hatch so the model is never forced onto a wrong
+# option.
 QUESTIONS: Dict[str, Any] = {
-    QUESTION_ID: {
+    "directed_at": {
         "type": "choice",
         "instructions": (
-            "How should the assistant respond to `message`, given `thread_context`? "
-            "The assistant is already a participant in this Slack thread and has "
-            "already replied at least once."
+            "In this Slack thread, who is `message` addressed to? The assistant is "
+            "called LaHermes."
         ),
         "criteria": {
-            "reply": (
-                "The message asks the assistant something, addresses it by name or "
-                "as @bot, requests data/report/work, or is a follow-up that clearly "
-                "needs the assistant's answer."
+            "assistant": (
+                "It addresses the assistant: by the name LaHermes, as @bot, or as an "
+                "answer to something the assistant asked."
             ),
-            "react": (
-                "The message is a completed acknowledgement or status note (thanks, "
-                "noted, ok, done, received) that needs a light acknowledgement and "
-                "no answer."
+            "another_person": (
+                "It addresses a different person. Any name or @mention that is not "
+                "LaHermes is another person, including when the message asks that "
+                "person to do something. Situation: a colleague asks another "
+                "colleague to check something."
             ),
-            "silent": (
-                "The message is between other people — addressed to another person "
-                "by name, or continuing a side conversation — or adds nothing the "
-                "assistant could usefully contribute."
+            "everyone": (
+                "Addressed to the thread or to nobody in particular. Situation: a "
+                "general note."
             ),
-            "other": "None of the above is a clear fit.",
+            "unclear": "Cannot tell who is being addressed.",
         },
-    }
+    },
+    "request_type": {
+        "type": "choice",
+        "instructions": "What kind of message is `message`?",
+        "criteria": {
+            "question_or_task": "It asks something or requests work.",
+            "acknowledgement": (
+                "It only acknowledges something already done. Situation: thanks, "
+                "noted, ok, received, done."
+            ),
+            "status_or_note": (
+                "It reports status or informs without asking for anything. "
+                "Situation: I will do that later, I sent the file."
+            ),
+            "other": "None of the above.",
+        },
+    },
+    "needs_answer": {
+        "type": "noul",
+        "instructions": "Does `message` require the assistant to produce an answer?",
+        "criteria": {
+            "true": "The assistant is expected to reply with information or work.",
+            "false": (
+                "Nobody is waiting for the assistant, even if other people are talking."
+            ),
+        },
+    },
 }
 
 
@@ -200,32 +235,71 @@ def decide_followup(
     tokens = usage.get("input_tokens")
 
     try:
-        answer = (payload.get("answers") or {}).get(QUESTION_ID) or {}
-        choice = str(answer.get("choice") or "").strip().lower()
-        confidence = answer.get("confidence")
-        confidence = float(confidence) if isinstance(confidence, (int, float)) else None
+        answers = payload.get("answers") or {}
+        directed = answers.get("directed_at") or {}
+        request = answers.get("request_type") or {}
+        needs = answers.get("needs_answer") or {}
+        directed_choice = str(directed.get("choice") or "").strip().lower()
+        request_choice = str(request.get("choice") or "").strip().lower()
+        directed_conf = directed.get("confidence")
+        directed_conf = float(directed_conf) if isinstance(directed_conf, (int, float)) else 0.0
+        request_conf = request.get("confidence")
+        request_conf = float(request_conf) if isinstance(request_conf, (int, float)) else 0.0
+        needs_prob = needs.get("noul")
+        needs_prob = float(needs_prob) if isinstance(needs_prob, (int, float)) else None
     except Exception:
         return TriageDecision(
             reason="unparseable_answer", latency_ms=latency_ms, tokens=tokens
         )
 
     floor = _floor() if confidence_floor is None else confidence_floor
-    if choice not in {"silent", "react"}:
-        # `reply` and `other` both mean "let the model handle it": reply is the
-        # previous behaviour, and `other` is the rubric's escape hatch.
+    detail = f"directed_at={directed_choice or '?'}({directed_conf:.2f})"
+
+    # 1. Addressed to somebody who is not the assistant: stay out of it, even
+    #    when the message asks that person to do work. This is the case the
+    #    single-question rubric got wrong in the loud direction (it answered
+    #    react/reply for other people's conversations).
+    if directed_choice == "another_person" and directed_conf >= floor:
         return TriageDecision(
-            reason=f"choice={choice or 'missing'}", latency_ms=latency_ms,
-            confidence=confidence, tokens=tokens,
+            action="silent", confidence=directed_conf, reason=f"ok;{detail}",
+            latency_ms=latency_ms, tokens=tokens,
         )
-    if confidence is None:
+
+    # 2. Addressed to the assistant and waiting for it: let the model answer.
+    #    Returned as no-action on purpose — `reply` is the previous behaviour, so
+    #    there is nothing to short-circuit and no state to keep in sync.
+    if (
+        directed_choice == "assistant"
+        and directed_conf >= floor
+        and (needs_prob or 0.0) >= 0.6
+    ):
         return TriageDecision(
-            reason="no_confidence", latency_ms=latency_ms, tokens=tokens
+            reason=f"choice=reply;{detail}", latency_ms=latency_ms,
+            confidence=min(directed_conf, needs_prob or 0.0), tokens=tokens,
         )
-    if confidence < floor:
+
+    # 3. A finished acknowledgement: one emoji, no turn.
+    if (
+        request_choice == "acknowledgement"
+        and request_conf >= floor
+        and not (directed_choice == "assistant" and (needs_prob or 0.0) >= 0.6)
+    ):
         return TriageDecision(
-            reason=f"below_floor({confidence:.2f}<{floor:.2f})",
-            confidence=confidence, latency_ms=latency_ms, tokens=tokens,
+            action="react", confidence=request_conf,
+            reason=f"ok;{detail};request_type=acknowledgement",
+            latency_ms=latency_ms, tokens=tokens,
         )
+
+    # 4. Nothing anywhere is waiting on the assistant: stay silent.
+    if needs_prob is not None and needs_prob <= 0.15:
+        return TriageDecision(
+            action="silent", confidence=round(1.0 - needs_prob, 4),
+            reason=f"ok;needs_answer={needs_prob:.2f}", latency_ms=latency_ms, tokens=tokens,
+        )
+
+    # Anything else falls through to the model triage — including every case the
+    # rubric is unsure about, which is what keeps this fail-open in practice.
     return TriageDecision(
-        action=choice, confidence=confidence, reason="ok", latency_ms=latency_ms, tokens=tokens
+        reason=f"no_confident_action;{detail}",
+        confidence=directed_conf or None, latency_ms=latency_ms, tokens=tokens,
     )

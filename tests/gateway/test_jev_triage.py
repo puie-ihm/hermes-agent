@@ -41,9 +41,25 @@ def _key(monkeypatch):
     monkeypatch.delenv("JEV_TRIAGE_TIMEOUT_S", raising=False)
 
 
-def _answers(choice, confidence):
-    return {"model": "jev-1.13.0", "answers": {"response": {"type": "choice",
-            "choice": choice, "confidence": confidence, "probabilities": {choice: confidence}}},
+def _answers(choice, confidence, *, directed="assistant", needs=0.9):
+    """Fan-out answer set. `choice` now means the composed action's source:
+    a direct `another_person` routing, an acknowledgement, or a reply."""
+    answers = {
+        "directed_at": {"type": "choice", "choice": directed, "confidence": confidence,
+                        "probabilities": {directed: confidence}},
+        "request_type": {"type": "choice", "choice": "question_or_task", "confidence": 0.9,
+                         "probabilities": {"question_or_task": 0.9}},
+        "needs_answer": {"type": "noul", "noul": needs},
+    }
+    if choice == "react":
+        answers["request_type"] = {"type": "choice", "choice": "acknowledgement",
+                                   "confidence": confidence,
+                                   "probabilities": {"acknowledgement": confidence}}
+    if choice == "silent":
+        answers["directed_at"] = {"type": "choice", "choice": "another_person",
+                                  "confidence": confidence,
+                                  "probabilities": {"another_person": confidence}}
+    return {"model": "jev-1.13.0", "answers": answers,
             "usage": {"input_tokens": 321, "output_tokens": 9}}
 
 
@@ -52,13 +68,14 @@ def _answers(choice, confidence):
 def test_confident_silent_acts(monkeypatch):
     monkeypatch.setattr(jev_triage.urllib.request, "urlopen",
                         lambda *a, **k: _fake_response(_answers("silent", 0.93)))
-    d = jev_triage.decide_followup("เดี๋ยวผมคุยกับทีมก่อนนะ")
+    d = jev_triage.decide_followup("ให้พี่ปุ้ยช่วยเช็คให้หน่อย")   # another person
     assert d.action == "silent" and d.confidence == 0.93 and d.tokens == 321
 
 
 def test_confident_react_acts(monkeypatch):
+    # needs_answer low: a pure acknowledgement, nobody is waiting on the bot
     monkeypatch.setattr(jev_triage.urllib.request, "urlopen",
-                        lambda *a, **k: _fake_response(_answers("react", 0.92)))
+                        lambda *a, **k: _fake_response(_answers("react", 0.92, needs=0.2)))
     d = jev_triage.decide_followup("ขอบคุณครับ")
     assert d.action == "react"
 
@@ -69,19 +86,22 @@ def test_low_confidence_falls_through(monkeypatch):
     monkeypatch.setattr(jev_triage.urllib.request, "urlopen",
                         lambda *a, **k: _fake_response(_answers("silent", 0.31)))
     d = jev_triage.decide_followup("ข้อความทดสอบ 1")
-    assert d.action is None and "below_floor" in d.reason
+    assert d.action is None and "no_confident_action" in d.reason
 
 
 def test_reply_falls_through_to_the_model(monkeypatch):
     monkeypatch.setattr(jev_triage.urllib.request, "urlopen",
                         lambda *a, **k: _fake_response(_answers("reply", 0.99)))
     d = jev_triage.decide_followup("LaHermes ช่วยสรุปให้หน่อย")
-    assert d.action is None and d.reason == "choice=reply"
+    assert d.action is None and "choice=reply" in d.reason
 
 
 def test_other_choice_falls_through(monkeypatch):
+    payload = _answers("reply", 0.99)
+    payload["answers"]["directed_at"] = {"type": "choice", "choice": "unclear",
+                                         "confidence": 0.99}
     monkeypatch.setattr(jev_triage.urllib.request, "urlopen",
-                        lambda *a, **k: _fake_response(_answers("other", 0.99)))
+                        lambda *a, **k: _fake_response(payload))
     assert jev_triage.decide_followup("???").action is None
 
 
@@ -116,12 +136,14 @@ def test_malformed_body_falls_through(monkeypatch):
 
 
 def test_missing_confidence_falls_through(monkeypatch):
-    payload = {"answers": {"response": {"type": "choice", "choice": "silent"}},
+    payload = {"answers": {"directed_at": {"type": "choice", "choice": "another_person"},
+                           "request_type": {"type": "choice", "choice": "status_or_note"},
+                           "needs_answer": {"type": "noul", "noul": 0.4}},
                "usage": {"input_tokens": 10}}
     monkeypatch.setattr(jev_triage.urllib.request, "urlopen",
                         lambda *a, **k: _fake_response(payload))
     d = jev_triage.decide_followup("hello")
-    assert d.action is None and d.reason == "no_confidence"
+    assert d.action is None and "no_confident_action" in d.reason
 
 
 def test_no_key_is_disabled(monkeypatch):
@@ -170,7 +192,10 @@ def test_request_uses_pinned_model_and_rubric(monkeypatch):
     assert seen["url"] == "https://api.typesafe.ai/v1/systemone"
     assert seen["body"]["model"] == "jev-1.13.0"          # pinned, not jev-latest
     assert seen["body"]["state"]["thread_context"].startswith("Puie:")
-    assert "other" in seen["body"]["questions"]["response"]["criteria"]  # escape hatch
+    q = seen["body"]["questions"]
+    assert set(q) == {"directed_at", "request_type", "needs_answer"}   # fan-out
+    assert "unclear" in q["directed_at"]["criteria"]                   # escape hatches
+    assert "other" in q["request_type"]["criteria"]
     assert seen["ua"] == "ihm-lahermes/1.0"
 
 
@@ -209,3 +234,42 @@ def test_env_still_works_as_a_fallback(monkeypatch):
     monkeypatch.setattr(scope, "get_secret", lambda name, default=None: None)
     monkeypatch.setenv("TYPESAFE_API_KEY", "apik_from_env")
     assert jev_triage.is_enabled() is True
+
+
+# ---- the composed decision (fan-out) --------------------------------------
+
+def test_another_person_silences_even_when_that_person_is_asked_to_work(monkeypatch):
+    """The case the single-question rubric got wrong in the loud direction:
+    a colleague asking a colleague to check something is not our business."""
+    monkeypatch.setattr(jev_triage.urllib.request, "urlopen",
+                        lambda *a, **k: _fake_response(_answers("silent", 0.98, needs=0.9)))
+    d = jev_triage.decide_followup("ให้พี่ปุ้ยช่วยเช็คให้หน่อยได้ไหม")
+    assert d.action == "silent" and d.confidence == 0.98
+
+
+def test_addressed_to_assistant_replies_via_the_model(monkeypatch):
+    monkeypatch.setattr(jev_triage.urllib.request, "urlopen",
+                        lambda *a, **k: _fake_response(
+                            _answers("reply", 0.96, directed="assistant", needs=0.95)))
+    d = jev_triage.decide_followup("บอทช่วยสรุปยอด WMBR ให้หน่อย")
+    assert d.action is None and "choice=reply" in d.reason
+
+
+def test_low_needs_answer_silences(monkeypatch):
+    monkeypatch.setattr(jev_triage.urllib.request, "urlopen",
+                        lambda *a, **k: _fake_response(
+                            _answers("reply", 0.9, directed="everyone", needs=0.05)))
+    d = jev_triage.decide_followup("เดี๋ยวผมคุยกับทีมก่อนนะ")
+    assert d.action == "silent"
+
+
+def test_acknowledgement_addressed_to_the_assistant_prefers_reply(monkeypatch):
+    """"thanks, can you also send the CSV?" is a request, not an ack."""
+    payload = _answers("react", 0.99)
+    payload["answers"]["directed_at"] = {"type": "choice", "choice": "assistant",
+                                         "confidence": 0.99}
+    payload["answers"]["needs_answer"] = {"type": "noul", "noul": 0.9}
+    monkeypatch.setattr(jev_triage.urllib.request, "urlopen",
+                        lambda *a, **k: _fake_response(payload))
+    d = jev_triage.decide_followup("ขอบคุณครับ แล้วช่วยส่ง CSV ด้วย")
+    assert d.action is None

@@ -289,6 +289,7 @@ def test_runtime_main_sync_happens_after_restore():
             "api_key": "primary-key",
             "api_mode": "anthropic_messages",
             "auth_mode": "",
+            "session_id": "sess-1",
         },
     )]
 
@@ -436,6 +437,7 @@ def test_preflight_still_runs_for_other_session_with_same_db(tmp_path):
     agent._compress_context.assert_called()
 
 
+
 def test_expired_cooldown_allows_preflight(tmp_path):
     agent = _make_agent_with_cooldown(
         tmp_path / "state.db",
@@ -450,4 +452,3 @@ def test_expired_cooldown_allows_preflight(tmp_path):
     assert isinstance(ctx, TurnContext)
     agent._emit_status.assert_called_once()
     agent._compress_context.assert_called()
-

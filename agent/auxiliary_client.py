@@ -970,6 +970,8 @@ class _CodexCompletionsAdapter:
         timeout = kwargs.get("timeout")
         if timeout is not None:
             resp_kwargs["timeout"] = timeout
+        if isinstance(kwargs.get("extra_headers"), dict) and kwargs["extra_headers"]:
+            resp_kwargs["extra_headers"] = dict(kwargs["extra_headers"])
 
         # Note: the Codex endpoint (chatgpt.com/backend-api/codex) does NOT
         # support max_output_tokens or temperature — omit to avoid 400 errors.
@@ -1364,6 +1366,11 @@ class _AnthropicCompletionsAdapter:
             from agent.anthropic_adapter import _forbids_sampling_params
             if not _forbids_sampling_params(model):
                 anthropic_kwargs["temperature"] = temperature
+        if isinstance(kwargs.get("extra_headers"), dict) and kwargs["extra_headers"]:
+            anthropic_kwargs["extra_headers"] = {
+                **(anthropic_kwargs.get("extra_headers") or {}),
+                **kwargs["extra_headers"],
+            }
 
         # Pass through caller-supplied extra_body so providers behind
         # Anthropic-compatible gateways receive their per-vendor request
@@ -2332,10 +2339,11 @@ _RUNTIME_MAIN_BASE_URL: str = ""
 _RUNTIME_MAIN_API_KEY: Any = ""
 _RUNTIME_MAIN_API_MODE: str = ""
 _RUNTIME_MAIN_AUTH_MODE: str = ""
+_RUNTIME_MAIN_SESSION_ID: str = ""
 _RUNTIME_MAIN_CONTEXT: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
     contextvars.ContextVar("auxiliary_runtime_main", default=None)
 )
-_RUNTIME_MAIN_COMPAT_SNAPSHOT: Tuple[Any, ...] = ("", "", "", "", "", "")
+_RUNTIME_MAIN_COMPAT_SNAPSHOT: Tuple[Any, ...] = ("", "", "", "", "", "", "")
 _RUNTIME_MAIN_COMPAT_LOCK = threading.Lock()
 
 
@@ -2356,6 +2364,7 @@ def _compat_runtime_main() -> Optional[Dict[str, Any]]:
         _RUNTIME_MAIN_API_KEY,
         _RUNTIME_MAIN_API_MODE,
         _RUNTIME_MAIN_AUTH_MODE,
+        _RUNTIME_MAIN_SESSION_ID,
     )
     if values == _RUNTIME_MAIN_COMPAT_SNAPSHOT:
         return None
@@ -2382,6 +2391,7 @@ def set_runtime_main(
     api_key: Any = "",
     api_mode: str = "",
     auth_mode: str = "",
+    session_id: str = "",
 ) -> contextvars.Token:
     """Record the current context's live main runtime for auxiliary routing.
 
@@ -2390,7 +2400,8 @@ def set_runtime_main(
     """
     global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
     global _RUNTIME_MAIN_BASE_URL, _RUNTIME_MAIN_API_KEY, _RUNTIME_MAIN_API_MODE
-    global _RUNTIME_MAIN_AUTH_MODE, _RUNTIME_MAIN_COMPAT_SNAPSHOT
+    global _RUNTIME_MAIN_AUTH_MODE, _RUNTIME_MAIN_SESSION_ID
+    global _RUNTIME_MAIN_COMPAT_SNAPSHOT
     runtime = {
         "provider": (provider or "").strip().lower(),
         "model": (model or "").strip(),
@@ -2402,6 +2413,7 @@ def set_runtime_main(
         ),
         "api_mode": (api_mode or "").strip(),
         "auth_mode": (auth_mode or "").strip().lower(),
+        "session_id": (session_id or "").strip(),
     }
     # Publish authoritative context before updating locked compatibility
     # mirrors; concurrent sessions never read those mirrors at runtime.
@@ -2414,6 +2426,7 @@ def set_runtime_main(
             _RUNTIME_MAIN_API_KEY,
             _RUNTIME_MAIN_API_MODE,
             _RUNTIME_MAIN_AUTH_MODE,
+            _RUNTIME_MAIN_SESSION_ID,
         ) = (runtime[field] for field in _MAIN_RUNTIME_FIELDS)
         _RUNTIME_MAIN_COMPAT_SNAPSHOT = tuple(
             runtime[field] for field in _MAIN_RUNTIME_FIELDS
@@ -2864,7 +2877,9 @@ _AUTO_PROVIDER_LABELS = {
     "_resolve_api_key_provider": "api-key",
 }
 
-_MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode", "auth_mode")
+_MAIN_RUNTIME_FIELDS = (
+    "provider", "model", "base_url", "api_key", "api_mode", "auth_mode", "session_id"
+)
 
 
 def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -6833,7 +6848,11 @@ def _build_call_kwargs(
         ):
             kwargs["_reasoning_config"] = dict(reasoning_config)
 
-    return kwargs
+    from agent.opencode_affinity import merge_opencode_session_headers
+
+    return merge_opencode_session_headers(
+        kwargs, provider, base_url, _runtime_main_value("session_id") or None
+    )
 
 
 def _validate_llm_response(

@@ -11537,16 +11537,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             group_sessions_per_user=_group_sessions_per_user,
             thread_sessions_per_user=_thread_sessions_per_user,
         )
-        if _is_shared_multi_user and source.user_name:
-            # source.user_name is the platform display name — attacker-
-            # influenceable on any platform that lets participants set their
-            # own name. Neutralize embedded newlines/control chars before
-            # interpolating it into every message in the shared session, or
-            # a hostile name can masquerade as a fake markdown section
-            # (mirrors the same field's treatment in
-            # build_session_context_prompt via _format_untrusted_prompt_value).
-            _safe_user_name = neutralize_untrusted_inline_text(source.user_name)
-            message_text = f"[{_safe_user_name}] {message_text}"
+        if _is_shared_multi_user and (source.user_name or source.user_id):
+            # A shared thread keeps one conversation, so every turn needs an
+            # explicit, gateway-authenticated actor identity. Display names
+            # are attacker-controlled; encode the envelope as compact JSON so
+            # quotes/brackets/newlines cannot alter its structure.
+            _actor = {"platform": source.platform.value}
+            if source.scope_id:
+                _actor["workspace_id"] = neutralize_untrusted_inline_text(
+                    source.scope_id
+                )
+            if source.user_id:
+                _actor["user_id"] = neutralize_untrusted_inline_text(source.user_id)
+            if source.user_name:
+                _actor["display_name"] = neutralize_untrusted_inline_text(
+                    source.user_name
+                )
+            message_text = (
+                f"[Gateway actor {json.dumps(_actor, ensure_ascii=False, separators=(',', ':'))}] "
+                f"{message_text}"
+            )
 
         # Prepend channel context from history backfill (if any).  This
         # happens after sender-prefix so the prefix only applies to the

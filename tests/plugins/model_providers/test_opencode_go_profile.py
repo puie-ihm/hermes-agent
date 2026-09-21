@@ -218,6 +218,40 @@ class TestOpenCodeGoFullKwargsIntegration:
         assert "extra_body" not in kwargs
         assert kwargs["reasoning_effort"] == "high"
 
+    def test_message_name_is_removed_before_reaching_go_relay(self, opencode_go_profile):
+        from agent.transports.chat_completions import ChatCompletionsTransport
+
+        original = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "kb_search", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "name": "kb_search",
+                "tool_call_id": "call-1",
+                "content": "result",
+            },
+        ]
+
+        kwargs = ChatCompletionsTransport().build_kwargs(
+            model="glm-5.3-flash",
+            messages=original,
+            tools=None,
+            provider_profile=opencode_go_profile,
+        )
+
+        assert "name" not in kwargs["messages"][1]
+        assert kwargs["messages"][1]["tool_call_id"] == "call-1"
+        assert original[1]["name"] == "kb_search"
+
     def test_deepseek_thinking_reaches_extra_body_and_top_level(
         self, opencode_go_profile
     ):

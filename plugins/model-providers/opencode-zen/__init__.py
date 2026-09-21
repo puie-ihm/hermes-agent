@@ -49,6 +49,25 @@ class OpenCodeGoProfile(ProviderProfile):
         "mimo-v2.5-pro": 131072,
     }
 
+    def prepare_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop optional message ``name`` fields rejected by the Go relay.
+
+        Hermes stores the function name on tool-result messages for providers
+        that use the older Chat Completions convention. OpenCode Go rejects the
+        otherwise valid optional field with ``messages[N]: \"name\" is not
+        supported by this endpoint``. ``tool_call_id`` retains the required
+        tool-result linkage, so removing only the redundant top-level name is
+        lossless for this provider.
+        """
+        if not any(isinstance(message, dict) and "name" in message for message in messages):
+            return messages
+        return [
+            {key: value for key, value in message.items() if key != "name"}
+            if isinstance(message, dict) and "name" in message
+            else message
+            for message in messages
+        ]
+
     def get_max_tokens(self, model: str | None) -> int | None:
         cap = self._MODEL_MAX_TOKENS.get(_flat_model_name(model))
         if cap is not None:

@@ -99,3 +99,31 @@ def test_main_turn_sends_affinity_on_every_transport(model, api_mode):
 
     kwargs = build_api_kwargs(agent, [{"role": "user", "content": "hi"}])
     assert kwargs["extra_headers"]["x-opencode-session"].startswith("hermes_")
+
+
+def test_out_of_conversation_call_still_sends_a_routable_session_header():
+    """The gateway describes an attached image BEFORE the turn exists.
+
+    ``gateway/run.py::_enrich_message_with_vision`` runs before any session
+    context is set, so there is no session id and no portal tag to digest.
+    Returning no header there is not "no affinity" — the relay answers
+    HTTP 400 MissingSessionID and the image description is lost (live
+    2026-09-22 17:02:19Z, first Slack image after vision moved to the Go leg).
+    """
+    from agent.portal_tags import set_conversation_context
+
+    set_conversation_context(None)  # precondition: not inside a conversation
+    headers = opencode_session_headers("opencode-go", "https://opencode.ai/zen/go/v1")
+    assert headers["x-opencode-session"].startswith("hermes_proc_")
+
+    # Stable for the process, so one-shot calls do not each open a bucket.
+    assert headers == opencode_session_headers(
+        "opencode-go", "https://opencode.ai/zen/go/v1"
+    )
+    # Never collides with real conversation affinity.
+    in_conversation = opencode_session_headers(
+        "opencode-go", "https://opencode.ai/zen/go/v1", "agent:main:slack:thread:C1:T1"
+    )
+    assert in_conversation["x-opencode-session"] != headers["x-opencode-session"]
+    # Non-OpenCode targets still get nothing at all.
+    assert opencode_session_headers("openrouter", "https://openrouter.ai/api/v1") == {}

@@ -3,10 +3,25 @@
 from __future__ import annotations
 
 import hashlib
+import uuid
 from typing import Any, Optional
 from urllib.parse import urlparse
 
 OPENCODE_SESSION_HEADER = "x-opencode-session"
+
+# Fallback affinity for calls that happen OUTSIDE a conversation (no portal
+# tags, no session id) — chiefly the gateway's pre-turn image description
+# (gateway/run.py::_enrich_message_with_vision). The relay rejects a request
+# with no session header at all with HTTP 400 MissingSessionID, so returning {}
+# there is not "no affinity", it is a failed call: observed live 2026-09-22
+# 17:02:19Z, the first Slack image after vision moved to the OpenCode Go leg
+# logged `Error analyzing image: Error code: 400 ... MissingSessionID` and fell
+# back to "I couldn't quite see it", leaving the turn to re-read the image with
+# its own vision_analyze call. One opaque value per process keeps those
+# one-shot calls routable without pooling every install into one bucket.
+_PROCESS_FALLBACK_SESSION_KEY = "hermes_proc_" + hashlib.sha256(
+    uuid.uuid4().hex.encode("utf-8")
+).hexdigest()[:32]
 
 
 def is_opencode_target(provider: Optional[str], base_url: Optional[str]) -> bool:
@@ -51,7 +66,10 @@ def opencode_session_headers(
     except Exception:
         pass
     if not key:
-        return {}
+        # Out-of-conversation call (see _PROCESS_FALLBACK_SESSION_KEY): return the
+        # value as-is instead of digesting it, so the header itself shows that
+        # this request had no conversation to attach affinity to.
+        return {OPENCODE_SESSION_HEADER: _PROCESS_FALLBACK_SESSION_KEY}
     # Never disclose the native gateway session key (which can contain Slack
     # workspace/channel/thread IDs) to the provider. The digest remains stable
     # for the conversation while different threads receive different affinity.

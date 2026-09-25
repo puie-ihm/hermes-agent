@@ -525,7 +525,7 @@ class SlackAdapter(BasePlatformAdapter):
         self._channel_team: Dict[str, str] = {}  # channel_id → team_id
         # Dedup cache: prevents duplicate bot responses when Socket Mode
         # reconnects redeliver events.
-        self._dedup = MessageDeduplicator()
+        self._dedup = MessageDeduplicator(max_size=10000, ttl_seconds=24 * 60 * 60)
         # Track pending approval message_ts → resolved flag to prevent
         # double-clicks on approval buttons.
         self._approval_resolved: Dict[str, bool] = {}
@@ -1183,12 +1183,8 @@ class SlackAdapter(BasePlatformAdapter):
             #
             # Socket Mode envelope ack: slack-bolt only sends the WebSocket
             # envelope ack to Slack when the listener calls ``await ack()``.
-            # If ack is not called within ``ack_timeout`` (default 3s), bolt
-            # logs ``warning_did_not_call_ack`` and the envelope stays unacked
-            # — Slack then re-delivers the same event after its retry timeout
-            # (~30s) or on the next Socket Mode reconnect. We've seen the same
-            # ``msg=`` ts re-enter the pipeline ~6 minutes later because of
-            # this, which the 5-min ``MessageDeduplicator`` TTL just misses.
+            # A delayed replay of the same message ts can arrive minutes later;
+            # the Slack deduplicator retains IDs for one day.
             # Ack BEFORE doing the slow work (relevance filter + agent turn)
             # so the envelope is settled immediately.
             @self._app.event("message")

@@ -1278,6 +1278,43 @@ class TestSendVideo:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
+async def test_slack_replay_is_deduplicated_for_one_day(adapter, monkeypatch):
+    """A delayed Socket Mode replay must not start a second agent turn."""
+    monkeypatch.delenv("SLACK_STALE_EVENT_TTL_SECONDS", raising=False)
+    adapter._resolve_user_name = AsyncMock(return_value="User")
+    now = 1_800_000_000.0
+    monkeypatch.setattr("gateway.platforms.helpers.time.time", lambda: now)
+    event = {
+        "text": "check the report",
+        "user": "U_USER",
+        "channel": "D123",
+        "channel_type": "im",
+        "ts": f"{now:.6f}",
+    }
+
+    await adapter._handle_slack_message(event)
+    now += 6 * 60
+    await adapter._handle_slack_message(event)
+    now += 23 * 60 * 60
+    await adapter._handle_slack_message(event)
+
+    adapter.handle_message.assert_awaited_once()
+
+    now += 60 * 60
+    await adapter._handle_slack_message(event)
+    assert adapter.handle_message.await_count == 2
+
+
+def test_slack_dedup_retains_more_than_default_cache_limit(adapter):
+    """A busy Slack workspace must not evict a one-day ID after 2,000 events."""
+    dedup = adapter._dedup
+    assert dedup.is_duplicate("original") is False
+    for index in range(2000):
+        assert dedup.is_duplicate(f"other-{index}") is False
+    assert dedup.is_duplicate("original") is True
+
+
 class TestBangPrefixCommands:
     """``!cmd`` is rewritten to ``/cmd`` so commands work inside Slack threads.
 

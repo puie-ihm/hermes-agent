@@ -510,7 +510,7 @@ def test_notifier_delivers_when_owning_profile_is_this_gateways_own_profile(
     ``hermes --profile front_external gateway run`` serves front_external out of
     ``self.adapters``; ``_profile_adapters`` holds only SECONDARY (multiplex)
     profiles and is empty in such a process. The fail-closed branch in
-    ``_authorization_adapter`` must therefore not treat the process's own active
+    ``_adapters_for_profile`` must therefore not treat the process's own active
     profile as an unregistered secondary profile.
 
     Regression: upstream ab70551b3 ("fail-closed adapter resolution for
@@ -521,18 +521,23 @@ def test_notifier_delivers_when_owning_profile_is_this_gateways_own_profile(
     no cursor movement. Observed in prod as front_external (Slack @fabboy) never
     relaying a finished analyst answer back to the user.
 
-    Mutation check: dropping the ``profile_name == self._active_profile_name()``
-    branch in gateway/authz_mixin.py makes this test FAIL — nothing is sent and
-    the completed event stays unseen.
+    v0.23.0 keeps this fork fix by a different route: ``_adapters_for_profile``
+    resolves a non-default profile against ``_primary_profile_name`` (captured at
+    construction) and falls back to ``self.adapters`` for the process's own
+    profile. This test pins that behaviour on the merged tree.
+
+    Mutation check: making ``_adapters_for_profile`` return ``{}`` for a
+    non-registry profile makes this test FAIL — nothing is sent and the
+    completed event stays unseen.
     """
     db_path = tmp_path / "own-profile.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="owned by this gateway", assignee="worker")
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="chat-own",
             notifier_profile="front_external",
         )

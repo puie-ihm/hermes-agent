@@ -316,8 +316,9 @@ def _slack_platform_notes(context: SessionContext) -> list[str]:
     lines = ["", _SLACK_TOOLS_NOTE if _slack_tools_loaded() else _SLACK_NO_TOOLS_NOTE]
     if context.shared_multi_user_session:
         lines.append(
-            "In shared Slack threads, use the current turn's sender prefix as the only verified "
-            "current-author mention target. Do not guess or reuse `<@U...>` mentions from names, "
+            "In shared Slack threads, use the `slack_mention` value from this turn's "
+            "`[Gateway actor {...}]` envelope prefix as the only verified current-author "
+            "mention target. Do not guess or reuse `<@U...>` mentions from names, "
             "memory, or prior conversation history."
         )
     return lines

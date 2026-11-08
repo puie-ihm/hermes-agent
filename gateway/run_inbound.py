@@ -1413,16 +1413,30 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             source, group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
         )
-        if _is_shared_multi_user and source.user_name:
-            # Display names are attacker-influenceable: neutralize newlines/control chars or a
-            # hostile name masquerades as a fake markdown section (mirrors build_session_context_prompt).
-            _safe_user_name = neutralize_untrusted_inline_text(source.user_name)
-            # Slack: expose the CURRENT speaker's verifiable `<@U...>` id so "mention me again" has a
-            # trusted target (display names are ambiguous). user_id comes from the envelope, not user-editable.
-            # See #17916.
-            if source.platform == Platform.SLACK and source.user_id:
-                _safe_user_name = f"{_safe_user_name} | Slack user <@{source.user_id}>"
-            message_text = f"[{_safe_user_name}] {message_text}"
+        if _is_shared_multi_user and (source.user_name or source.user_id):
+            # A shared thread keeps ONE conversation, so every turn needs an explicit,
+            # gateway-authenticated actor identity. Display names are attacker-influenceable;
+            # encode the envelope as compact JSON so quotes/brackets/newlines cannot alter
+            # its structure (fork 4e1bce52ab — ported here; upstream had only the name).
+            _actor: Dict[str, str] = {}
+            if source.platform is not None:
+                _actor["platform"] = source.platform.value
+            if source.scope_id:
+                _actor["workspace_id"] = neutralize_untrusted_inline_text(source.scope_id)
+            if source.user_id:
+                # From the envelope, never user-editable — the verified sender id.
+                _actor["user_id"] = neutralize_untrusted_inline_text(source.user_id)
+            if source.user_name:
+                _actor["display_name"] = neutralize_untrusted_inline_text(source.user_name)
+            # Slack: expose the SAME verified id in mention form so "mention me again" has a
+            # trusted target — derived from the envelope id, never from the display name (#17916).
+            if source.platform == Platform.SLACK and "user_id" in _actor:
+                _actor["slack_mention"] = f"<@{_actor['user_id']}>"
+            message_text = (
+                "[Gateway actor "
+                f"{json.dumps(_actor, ensure_ascii=False, separators=(',', ':'))}] "
+                f"{message_text}"
+            )
         # After the sender-prefix so the prefix applies only to the trigger message, not the backfill.
         if getattr(event, "channel_context", None):
             message_text = f"{event.channel_context}\n\n[New message]\n{message_text}"

@@ -126,6 +126,13 @@ class DispatchResult:
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+    policy_blocked: list[tuple[str, str, str]] = field(default_factory=list)
+    """``(task_id, created_by, assignee)`` hard-pinned by
+    ``kanban.assignee_allowlist``: the creator is not permitted to route work to
+    that assignee. Ready-lane cards are moved to ``blocked`` (kind
+    ``needs_input``) with a ``policy_violation`` audit event so they cannot loop
+    back into ``ready``; review-lane cards are only recorded, because
+    ``block_task`` does not transition out of ``review``."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -1991,6 +1998,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    assignee_allowlist: Optional[dict] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -2014,6 +2022,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            assignee_allowlist=assignee_allowlist,
         )
 
     try:
@@ -2063,12 +2072,36 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    assignee_allowlist: Optional[dict] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
     skip is recorded on ``result``.
     """
     task_id = row["id"]
+    # Server-side hard-pin: refuse a task whose (created_by -> assignee) pairing
+    # violates kanban.assignee_allowlist, so a prompt-injected creator cannot
+    # route work to an off-limits worker even if it bypassed the creation gate.
+    if assignee_allowlist:
+        violation = _kb.assignee_policy_violation(
+            assignee_allowlist, row["created_by"], assignee)
+        if violation is not None:
+            result.policy_blocked.append((task_id, row["created_by"] or "", assignee))
+            # A ready card is moved to blocked so it cannot loop back into
+            # ready_rows next tick; the policy_violation event is the audit
+            # trail. block_task does not transition out of 'review', so the
+            # review lane can only record + skip.
+            if not dry_run and lane == "ready" and _kb.block_task(
+                conn, task_id, reason=violation, kind="needs_input",
+            ):
+                with _kb.write_txn(conn):
+                    _kb._append_event(
+                        conn, task_id, "policy_violation",
+                        {"reason": violation,
+                         "created_by": row["created_by"],
+                         "assignee": assignee},
+                    )
+            return False
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
@@ -2296,7 +2329,7 @@ def _tick_spawn_budget(
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, created_by FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -2308,6 +2341,7 @@ def _any_spawnable_review(
     *,
     per_profile_cap: Optional[int] = None,
     per_profile_running: Optional[dict[str, int]] = None,
+    assignee_allowlist: Optional[dict] = None,
 ) -> bool:
     """Mirror review dispatch gates before reserving ready-lane capacity.
 
@@ -2328,6 +2362,12 @@ def _any_spawnable_review(
         if profile_exists is not None and not profile_exists(assignee):
             continue
         if per_profile_cap is not None and running.get(assignee, 0) >= per_profile_cap:
+            continue
+        # A row pinned out by kanban.assignee_allowlist cannot consume the
+        # reservation — _dispatch_lane_task refuses it this tick.
+        if assignee_allowlist and _kb.assignee_policy_violation(
+            assignee_allowlist, row["created_by"], assignee
+        ) is not None:
             continue
         if check_respawn_guard(conn, row["id"], lane="review") is None:
             return True
@@ -2366,6 +2406,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    assignee_allowlist: Optional[dict] = None,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -2383,6 +2424,11 @@ def _dispatch_once_locked(
     if not may_spawn:
         return result
 
+    if assignee_allowlist is None:
+        # Parse kanban.assignee_allowlist once per tick, before the review
+        # reservation so a pinned-out review row cannot withhold capacity. An
+        # empty dict means no policy (backward compatible).
+        assignee_allowlist = _kb.load_assignee_allowlist()
     ready_rows = _lane_rows(conn, "ready")
     # Review rows are enumerated up front so the budget split can see whether
     # review work exists at all.
@@ -2415,12 +2461,14 @@ def _dispatch_once_locked(
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review(
         conn, review_rows,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        assignee_allowlist=assignee_allowlist,
     ):
         ready_budget = max(spawn_budget - 1, 0)
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        assignee_allowlist=assignee_allowlist,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0

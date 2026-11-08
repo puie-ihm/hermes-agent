@@ -1155,6 +1155,18 @@ def _handle_create(args: dict, **kw) -> str:
     assignee = args.get("assignee")
     _check(assignee, "assignee is required — name the profile that should execute this "
                      "task (the dispatcher will only spawn tasks with an assignee)")
+    # Creation-time assignee allowlist (hard-pin): a prompt-injected creator must
+    # not be able to route work to an off-limits worker. Enforced against the
+    # trusted process identity, never a caller-supplied field; the dispatcher
+    # re-checks at spawn time so a row edited out-of-band is still refused.
+    try:
+        from hermes_cli.kanban_db import assignee_policy_violation, load_assignee_allowlist
+        violation = assignee_policy_violation(
+            load_assignee_allowlist(), _persisted_identity(), assignee)
+    except Exception:
+        violation = None
+    if violation:
+        raise _Reject(f"kanban_create: {violation}")
     # Workspace sharing is always explicit: omitted fields mean a fresh scratch workspace
     # even for a dispatcher-spawned creator (reusing the parent's path would let a child
     # mutate review evidence or race its checkout). Project identity is the one safe thing

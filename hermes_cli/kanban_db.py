@@ -1038,6 +1038,69 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _norm_profile_or_empty(name: Any) -> str:
+    """Normalize a profile name, mapping empty/None to ``""`` instead of raising.
+
+    ``normalize_profile_name`` raises ``ValueError`` on an empty string; the
+    allowlist helpers must tolerate NULL ``created_by`` / missing assignees
+    (legacy rows, unrouted tasks) without blowing up the dispatch loop.
+    """
+    from hermes_cli.profiles import normalize_profile_name
+
+    s = str(name or "").strip()
+    if not s:
+        return ""
+    try:
+        return normalize_profile_name(s)
+    except ValueError:
+        return ""
+
+
+def load_assignee_allowlist(cfg: Optional[dict] = None) -> dict[str, frozenset[str]]:
+    """Parse ``kanban.assignee_allowlist`` into ``{creator: frozenset(assignees)}``.
+
+    Names are normalized so they match the ``assignee`` / ``created_by``
+    columns. Malformed entries are dropped. An empty dict means "no policy"
+    (backward compatible — nothing is restricted).
+    """
+    try:
+        if cfg is None:
+            from hermes_cli.config import load_config
+            cfg = load_config()
+        from hermes_cli.config import cfg_get
+        raw = cfg_get(cfg, "kanban", "assignee_allowlist", default={}) or {}
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, frozenset[str]] = {}
+    for creator, allowed in raw.items():
+        if not isinstance(allowed, (list, tuple)):
+            continue
+        creator_key = _norm_profile_or_empty(creator)
+        if not creator_key:
+            continue
+        out[creator_key] = frozenset(
+            _norm_profile_or_empty(a) for a in allowed if str(a).strip()
+        )
+    return out
+
+
+def assignee_policy_violation(allowlist, created_by, assignee) -> Optional[str]:
+    """Return a human-readable reason when ``created_by -> assignee`` violates
+    the allowlist, else ``None``. Creators absent from the map are unrestricted.
+    """
+    if not allowlist:
+        return None
+    allowed = allowlist.get(_norm_profile_or_empty(created_by))
+    if allowed is None:
+        return None
+    if _norm_profile_or_empty(assignee) in allowed:
+        return None
+    return (f"assignee {assignee!r} is not permitted for tasks created by "
+            f"{created_by!r} (kanban.assignee_allowlist allows: {sorted(allowed)})")
+
+
 def _resolve_project_link(
     conn: sqlite3.Connection, project_id: Optional[str], project_source_task_id: Optional[str],
     workspace_kind: str, workspace_path: Optional[str],

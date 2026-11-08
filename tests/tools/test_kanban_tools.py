@@ -1818,3 +1818,47 @@ def test_worker_env_not_restricted(monkeypatch, tmp_path):
     assert kt._restricted_creator() is None
     d = json.loads(kt._handle_show({"task_id": foreign}))
     assert d.get("task", {}).get("id") == foreign
+
+
+# ---------------------------------------------------------------------------
+# Assignee allowlist (kanban.assignee_allowlist) — creation-time hard-pin
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def front_env(monkeypatch, tmp_path):
+    """Simulate a restricted creator profile (``front_external``) whose
+    config hard-pins it to a single assignee."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "front_external")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    (home / "config.yaml").write_text(
+        "kanban:\n"
+        "  assignee_allowlist:\n"
+        "    front_external:\n"
+        "      - ext_data_analyst\n",
+        encoding="utf-8",
+    )
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    return home
+
+
+def test_create_rejects_disallowed_assignee(front_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_create({"title": "leak", "assignee": "media_buyer"})
+    d = json.loads(out)
+    assert d.get("error"), f"expected rejection, got {d}"
+    assert "not permitted" in d["error"]
+
+
+def test_create_allows_pinned_assignee(front_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_create({"title": "ok", "assignee": "ext_data_analyst"})
+    d = json.loads(out)
+    assert d.get("ok") is True, f"expected success, got {d}"

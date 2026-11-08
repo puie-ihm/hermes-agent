@@ -1919,6 +1919,12 @@ DEFAULT_CONFIG = {
         # root profile named "default", so on a shared kanban.db every home can otherwise claim
         # default-assigned cards.
         "dispatch_profiles": None,
+        # Server-side assignee allowlist (hard-pin). Maps a creator profile to the set of
+        # assignees it may create/dispatch work for: {"front_external": ["ext_data_analyst"]}.
+        # Enforced at task creation AND at dispatch, so a prompt-injected creator cannot route
+        # work to an off-limits worker. Creators absent from the map are unrestricted; empty {}
+        # (default) disables the policy entirely (backward compatible).
+        "assignee_allowlist": {},
         # Per-profile task visibility scoping. Creator profiles listed here may only see and
         # mutate tasks they created: when one calls the kanban tools, foreign tasks are worded
         # as "not found" (no id enumeration), its listings are filtered to its own rows, and the

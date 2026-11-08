@@ -1919,6 +1919,13 @@ DEFAULT_CONFIG = {
         # root profile named "default", so on a shared kanban.db every home can otherwise claim
         # default-assigned cards.
         "dispatch_profiles": None,
+        # Per-profile task visibility scoping. Creator profiles listed here may only see and
+        # mutate tasks they created: when one calls the kanban tools, foreign tasks are worded
+        # as "not found" (no id enumeration), its listings are filtered to its own rows, and the
+        # tasks it creates are forced to scratch workspaces. Empty [] = no scoping (backward
+        # compatible). Dispatcher-spawned workers (HERMES_KANBAN_TASK set) keep their existing
+        # task-ownership scoping and are never restricted by this list.
+        "restrict_to_own_tasks": [],
         # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
         # decompose <id>` or the dashboard's Decompose button.
         "auto_decompose": True,

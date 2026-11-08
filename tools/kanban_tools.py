@@ -150,6 +150,48 @@ def _persisted_identity() -> str:
     return current_profile_name("worker") or "worker"
 
 
+def _restricted_creator() -> Optional[str]:
+    """Profile name when this caller is visibility-restricted, else ``None``.
+
+    A dispatcher-spawned worker (``HERMES_KANBAN_TASK`` set) is never restricted
+    here — its own task-ownership scoping already applies (see
+    :func:`_enforce_worker_task_ownership`). Restriction is opted into either by
+    the ``HERMES_KANBAN_RESTRICT_TO_OWN`` env flag or by listing the profile in
+    ``kanban.restrict_to_own_tasks``.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return None
+    prof = _persisted_identity()
+    if (os.environ.get("HERMES_KANBAN_RESTRICT_TO_OWN", "").strip().lower()
+            in {"1", "true", "yes"}):
+        return prof
+    try:
+        from hermes_cli.config import cfg_get, load_config
+
+        restricted = cfg_get(load_config(), "kanban", "restrict_to_own_tasks", default=[]) or []
+        if prof in {str(p).strip() for p in restricted}:
+            return prof
+    except Exception:
+        logger.debug("kanban: restrict_to_own_tasks lookup failed", exc_info=True)
+    return None
+
+
+def _visibility_guard(conn: Any, tid: Any, tool_name: str) -> None:
+    """Reject a restricted caller's foreign task id, worded as a genuine miss.
+
+    The wording is identical to a real not-found so a restricted caller cannot
+    enumerate task ids by probing for a distinct ``forbidden`` response.
+    """
+    creator = _restricted_creator()
+    if creator is None:
+        return
+    from hermes_cli import kanban_db as kb
+
+    task = kb.get_task(conn, str(tid))
+    if task is None or (getattr(task, "created_by", None) or "") != creator:
+        raise _Reject(f"{tool_name}: task {tid} not found")
+
+
 def _kanban_handler(tool_name: str) -> Callable:
     """Wrap a handler so every failure is a structured tool error. ``ValueError``
     (invalid board slug, DB validation such as cycle/self-link, ``AttachmentTooLarge``)
@@ -675,6 +717,7 @@ def _handle_show(args: dict, **kw) -> str:
                 "the board, then kanban_show(task_id=<id>) for full state."),
         })
     with _board(args.get("board")) as (kb, conn):
+        _visibility_guard(conn, tid, "kanban_show")
         task = _existing_task(kb, conn, tid)
         return json.dumps({
             "task": _fields(task, _TASK_FIELDS),
@@ -711,7 +754,9 @@ def _handle_list(args: dict, **kw) -> str:
         # One extra row lets the output report truncation without dumping the board.
         rows = kb.list_tasks(
             conn, assignee=args.get("assignee"), status=args.get("status"),
-            tenant=args.get("tenant"), include_archived=include_archived, limit=limit + 1)
+            tenant=args.get("tenant"), include_archived=include_archived, limit=limit + 1,
+            # A visibility-restricted creator only ever lists its own rows.
+            created_by=_restricted_creator())
         truncated = len(rows) > limit
         tasks = rows[:limit]
         return json.dumps({
@@ -741,6 +786,7 @@ def _handle_complete(args: dict, **kw) -> str:
     _require_dict_metadata(metadata)
     metadata = _stamp_worker_session_metadata(tid, metadata)
     with _board(args.get("board")) as (kb, conn):
+        _visibility_guard(conn, tid, "kanban_complete")
         # Goal-mode pre-completion judge gate (Issue #38367). Prevent workers from bypassing the auxiliary
         # judge by calling kanban_complete before acceptance criteria are met. Only enforce when a judge is
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
@@ -816,6 +862,7 @@ def _handle_block(args: dict, **kw) -> str:
         _require_text(args, "reason", "reason is required — explain what input you need"))
     kind = args.get("kind")
     with _board(args.get("board")) as (kb, conn):
+        _visibility_guard(conn, tid, "kanban_block")
         _check(kind is None or kind in kb.VALID_BLOCK_KINDS,
                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)")
         # The goal loop treats ANY blocked status as terminal, so kanban_block
@@ -857,6 +904,7 @@ def _handle_schedule(args: dict, **kw) -> str:
     _check(raw_reason is None or isinstance(raw_reason, str), "reason must be a string")
     reason = _redact(raw_reason.strip()) if raw_reason and raw_reason.strip() else None
     with _board(args.get("board")) as (kb, conn):
+        _visibility_guard(conn, tid, "kanban_schedule")
         # The goal loop treats ``scheduled`` as terminal like ``blocked``, so
         # parking would bypass the completion judge (see kanban_block, #38696).
         task = kb.get_task(conn, tid)
@@ -897,6 +945,7 @@ def _handle_request_review(args: dict, **kw) -> str:
                f"reviewer profile {reviewer!r} is not installed. "
                f"Installed profiles: {', '.join(list_profile_names())}")
     with _board(args.get("board")) as (kb, conn):
+        _visibility_guard(conn, tid, "kanban_request_review")
         _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary)
         try:
             ok, fail_reason = kb.request_review(
@@ -923,6 +972,7 @@ def _handle_request_changes(args: dict, **kw) -> str:
     reason = _redact(
         _require_text(args, "reason", "reason is required — describe the changes needed"))
     with _board(args.get("board")) as (kb, conn):
+        _visibility_guard(conn, tid, "kanban_request_changes")
         ok, detail = kb.request_changes(
             conn, tid, reason=reason, expected_run_id=_worker_run_id(tid))
         _check(ok, f"could not request changes for {tid}: {detail or 'invalid review state'}")
@@ -937,6 +987,7 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     tid = _worker_guard("kanban_heartbeat", args)
     from hermes_cli import kanban_db_dispatch as kbd
     with _board(args.get("board")) as (kb, conn):
+        _visibility_guard(conn, tid, "kanban_heartbeat")
         # The dispatcher pins HERMES_KANBAN_CLAIM_LOCK at spawn; the default
         # claimer covers locally-driven workers that bypassed the dispatcher.
         kb.heartbeat_claim(conn, tid, claimer=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"))
@@ -969,14 +1020,16 @@ def _handle_comment(args: dict, **kw) -> str:
     # with what reads as a system directive. See #19713.
     author = _persisted_identity()
     with _board(args.get("board")) as (kb, conn):
+        _visibility_guard(conn, tid, "kanban_comment")
         cid = kb.add_comment(conn, tid, author=author, body=str(body))
         return _ok(task_id=tid, comment_id=cid)
 
 
-def _store_attachment(board, tid, filename, data, content_type) -> str:
+def _store_attachment(board, tid, filename, data, content_type, tool_name: str = "kanban_attach") -> str:
     """Store via ``kanban_db.store_attachment_bytes`` (shared size cap, per-task
     dir, metadata row) so agent, dashboard, and CLI surfaces stay in lockstep."""
     with _board(board) as (kb, conn):
+        _visibility_guard(conn, tid, tool_name)
         att_id = kb.store_attachment_bytes(
             conn, tid, str(filename), data,
             content_type=content_type, uploaded_by="agent", board=board)
@@ -995,7 +1048,8 @@ def _handle_attach(args: dict, **kw) -> str:
         data = base64.b64decode(str(content_b64), validate=True)
     except (binascii.Error, ValueError) as e:
         raise _Reject(f"content_base64 is not valid base64: {e}")
-    return _store_attachment(args.get("board"), tid, filename, data, args.get("content_type"))
+    return _store_attachment(args.get("board"), tid, filename, data, args.get("content_type"),
+                             tool_name="kanban_attach")
 
 
 _MAX_ATTACH_URL_REDIRECTS = 5
@@ -1058,14 +1112,16 @@ def _handle_attach_url(args: dict, **kw) -> str:
         logger.exception("kanban_attach_url download failed")
         return tool_error(f"kanban_attach_url: failed to fetch {url}: {e}")
     return _store_attachment(
-        args.get("board"), tid, filename, data, args.get("content_type") or fetched_ct)
+        args.get("board"), tid, filename, data, args.get("content_type") or fetched_ct,
+        tool_name="kanban_attach_url")
 
 
 @_kanban_handler("kanban_attachments")
 def _handle_attachments(args: dict, **kw) -> str:
-    """List a task's attachments (read-only; no ownership restriction)."""
+    """List a task's attachments (read-only)."""
     tid = _require_task_id(args)
     with _board(args.get("board")) as (kb, conn):
+        _visibility_guard(conn, tid, "kanban_attachments")
         _existing_task(kb, conn, tid)
         return json.dumps({
             "ok": True, "task_id": tid,
@@ -1113,7 +1169,17 @@ def _handle_create(args: dict, **kw) -> str:
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
+    restricted = _restricted_creator()
+    if restricted is not None:
+        # A visibility-restricted creator cannot point a task at an arbitrary
+        # on-disk workspace, so pin it to a fresh scratch directory.
+        workspace_kind, workspace_path = "scratch", None
     with _board(args.get("board")) as (kb, conn):
+        if restricted is not None:
+            # Parents are validated once the connection is open: attaching work
+            # under a foreign task would leak its existence.
+            for _pid in (parents or []):
+                _visibility_guard(conn, _pid, "kanban_create")
         from gateway.session_context import get_session_env
         from tools.async_delegation import _current_origin_session_id
         self_tid = (os.environ.get("HERMES_KANBAN_TASK")
@@ -1277,6 +1343,7 @@ def _handle_unblock(args: dict, **kw) -> str:
     tid = str(tid)
     _enforce_worker_task_ownership(tid)
     with _board(args.get("board")) as (kb, conn):
+        _visibility_guard(conn, tid, "kanban_unblock")
         _check(kb.unblock_task(conn, tid), f"could not unblock {tid} (not blocked or unknown)")
         return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)))
 
@@ -1291,6 +1358,10 @@ def _handle_link(args: dict, **kw) -> str:
     child_id = args.get("child_id")
     _check(parent_id and child_id, "both parent_id and child_id are required")
     with _board(args.get("board")) as (kb, conn):
+        # Guard BOTH endpoints: a restricted creator can neither discover nor
+        # attach to a foreign task from either side of the edge.
+        for _eid in (parent_id, child_id):
+            _visibility_guard(conn, _eid, "kanban_link")
         gated = kb.link_tasks(
             conn, parent_id=parent_id, child_id=child_id,
             expected_child_run_id=_worker_run_id(str(child_id)))

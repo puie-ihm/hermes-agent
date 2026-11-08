@@ -962,8 +962,13 @@ def _resolve_slack_proxy_url() -> Optional[str]:
 
 def _slack_dedup_ttl_seconds() -> float:
     """Dedup window for Socket Mode replays (override: ``SLACK_DEDUP_TTL_SECONDS``).
-    Slack replays un-acked events on reconnect, sometimes minutes later, so the window must span the
-    worst-case gap; memory is bounded by ``MessageDeduplicator(max_size=...)``, not the TTL.
+
+    Slack replays un-acked events on reconnect, and a Socket Mode envelope that Slack
+    believed was never acked can be redelivered *hours* later (the 24h envelope retention
+    window), not just the ~6 min websocket reconnect gap. The window therefore defaults to
+    a full day so a late replay is suppressed instead of producing a second bot reply.
+    Memory is NOT bounded by the TTL — ``MessageDeduplicator(max_size=...)`` caps entries —
+    so a long window costs nothing beyond the max_size dict.
 
     See #4777.
     """
@@ -975,7 +980,7 @@ def _slack_dedup_ttl_seconds() -> float:
                 return value
         except ValueError:
             logger.warning("[Slack] Invalid SLACK_DEDUP_TTL_SECONDS=%r; using default", raw)
-    return 3600.0  # 1 hour — covers Slack reconnect redelivery windows
+    return 24 * 60 * 60.0  # 24h — Slack's envelope retention, i.e. the worst-case replay gap
 
 
 # Audio mimetype → extension matching the container bytes: Slack voice clips are MP4/AAC, and
@@ -1136,7 +1141,9 @@ class SlackAdapter(BasePlatformAdapter):
         # redelivery gap (max_size bounds memory, so a long window is safe).
         # Dedup cache: prevents duplicate bot responses when Socket Mode reconnects redeliver events
         # (#4777).
-        self._dedup = MessageDeduplicator(ttl_seconds=_slack_dedup_ttl_seconds())
+        # Dedup cache: Slack redelivers un-acked Socket Mode envelopes on reconnect (up to its 24h
+        # retention), so the window is a day; max_size — not the TTL — bounds memory.
+        self._dedup = MessageDeduplicator(max_size=10000, ttl_seconds=_slack_dedup_ttl_seconds())
         # ts of messages already routed to the agent, so later edits don't re-trigger a reply.
         self._processed_message_ts: dict[str, float] = {}
         # approval / clarify message_ts (or (team_id, ts)) → resolved; blocks double-clicks.

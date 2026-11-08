@@ -57,8 +57,39 @@ def test_default_ttl_outlasts_slack_reconnect_redelivery_window():
         assert _slack_dedup_ttl_seconds() >= 1800.0
 
 
+def test_default_ttl_is_a_full_day():
+    """Fork semantics: a day, not an hour.
+
+    Slack retains un-acked Socket Mode envelopes for 24h, so a replay can land
+    hours after the original. An hour-long window let those through.
+    """
+    with patch.dict(os.environ, {}, clear=True):
+        assert _slack_dedup_ttl_seconds() == 24 * 60 * 60.0
+
+
 def test_env_override_is_respected():
     with patch.dict(os.environ, {"SLACK_DEDUP_TTL_SECONDS": "120"}, clear=True):
         assert _slack_dedup_ttl_seconds() == 120.0
+
+
+def test_adapter_bounds_memory_by_max_size_not_ttl():
+    """A 24h window must not mean an unbounded cache: max_size caps entries.
+
+    Pins the fork's ``MessageDeduplicator(max_size=10000, ttl_seconds=24h)``
+    construction on the real adapter — if the TTL is raised without max_size, a
+    busy workspace leaks a day of message ts into the dict.
+    """
+    from gateway.config import Platform, PlatformConfig
+    from plugins.platforms.slack.adapter import SlackAdapter
+
+    adapter = SlackAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"bot_token": "xoxb-test-token", "app_token": "xapp-test-token"},
+        )
+    )
+    assert adapter._dedup._max_size == 10000
+    assert adapter._dedup._ttl == 24 * 60 * 60.0
+    assert adapter.platform == Platform.SLACK
 
 

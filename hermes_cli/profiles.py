@@ -667,6 +667,14 @@ class ProfileInfo:
     # True when ``description`` was LLM-generated and not yet user-confirmed (dashboard
     # shows a "review" badge).
     description_auto: bool = False
+    # False when ``profile.yaml`` sets ``kanban_auto_assignable: false`` (fork feature, ported
+    # from b1fd81198a + 56fb13ec62). Despite the name it governs kanban auto-routing in BOTH
+    # directions: such a profile is never offered to the decomposer as a routing target AND its
+    # own tasks are never decomposed, so an externally-sourced request cannot be fanned out to
+    # internal workers. Declared in the profile's OWN profile.yaml so the policy travels with the
+    # profile rather than living in a central exclude-list. Defaults True — a profile that says
+    # nothing stays routable, which is the pre-existing behaviour.
+    kanban_auto_assignable: bool = True
     # Presentation-only display name; resolution/comparison/spawn always use ``name``.
     display_name: str = ""
     # Bot Mode title (``profile.yaml`` ``ui_meta['hermes-bots'].title``) — the name
@@ -878,6 +886,9 @@ def read_profile_meta(profile_dir: Path) -> dict:
         return {
             "description": str(data.get("description") or "").strip(),
             "description_auto": bool(data.get("description_auto", False)),
+            # Kanban auto-routing opt-out (fork b1fd81198a/56fb13ec62). Fail-open: a profile
+            # that says nothing stays routable, preserving pre-existing behaviour.
+            "kanban_auto_assignable": bool(data.get("kanban_auto_assignable", True)),
             "display_name": str(data.get("display_name") or "").strip(),
             "bot_title": bot_title,
             "previous_names": _clean_previous_names(data.get("previous_names")),

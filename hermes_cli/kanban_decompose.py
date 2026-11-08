@@ -126,6 +126,23 @@ def _profile_author() -> str:
     return _specify_author("decomposer")
 
 
+def _is_auto_assignable(name: str) -> bool:
+    """True unless ``name``'s profile.yaml opts out of kanban auto-routing.
+
+    ``kanban_auto_assignable: false`` means "outside kanban auto-routing in both
+    directions": never a fan-out target, and its own tasks never decomposed.
+    Unknown/unreadable profiles are treated as assignable, matching the
+    deliberately fail-open default in ``profiles.read_profile_meta``.
+    """
+    if not name:
+        return True
+    try:
+        meta = profiles_mod.read_profile_meta(profiles_mod.get_profile_dir(name))
+    except Exception:
+        return True
+    return bool(meta.get("kanban_auto_assignable", True))
+
+
 def _resolve_profile_from_cfg(cfg: dict, key: str, *, fallback: Optional[str] = None) -> str:
     """``kanban.<key>`` if it names an existing profile, else ``fallback``
     (the root task's own assignee) if that does, else the active default
@@ -137,20 +154,31 @@ def _resolve_profile_from_cfg(cfg: dict, key: str, *, fallback: Optional[str] = 
     runs inside whatever profile hosts the dispatcher — an operator's
     credential-less incognito profile, say — and that profile must never
     silently become the owner of work the card was assigned away from (#114294).
+
+    ``default_assignee`` additionally skips profiles that opted out of kanban
+    auto-routing (fork b1fd81198a): this key IS the auto-routing fallback, so a
+    profile that must never receive auto-routed work cannot be its value. The
+    active-profile fallback gets the same guard — on a dedicated locked-down
+    gateway running the decomposer, the naive fallback would hand that very
+    profile the work the flag exists to keep away. A configured
+    ``orchestrator_profile`` is NOT filtered: it is an explicit operator
+    choice about who owns root cards, not an automatic route.
     """
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     explicit = (kanban_cfg.get(key) or "").strip()
+    _guard = _is_auto_assignable if key == "default_assignee" else (lambda _n: True)
     for candidate in (explicit, (fallback or "").strip()):
         if candidate:
             try:
-                if profiles_mod.profile_exists(candidate):
+                if profiles_mod.profile_exists(candidate) and _guard(candidate):
                     return candidate
             except Exception:
                 pass
     try:
-        return profiles_mod.get_active_profile_name() or "default"
+        active = profiles_mod.get_active_profile_name() or "default"
     except Exception:
         return "default"
+    return active if _guard(active) else "default"
 
 
 def _build_roster() -> tuple[list[dict], set[str]]:
@@ -163,13 +191,23 @@ def _build_roster() -> tuple[list[dict], set[str]]:
         return [], set()
     roster = []
     for p in all_profiles:
+        # A profile can opt itself out of kanban auto-routing via
+        # ``kanban_auto_assignable: false`` in its own profile.yaml. Skip it in BOTH the
+        # prompt roster and the valid-set: leaving it in the valid-set would let an
+        # LLM-chosen assignee survive _normalize_assignee_choice() even though it was
+        # never offered (fork b1fd81198a).
+        if not getattr(p, "kanban_auto_assignable", True):
+            logger.debug(
+                "decompose: profile %s is not auto-assignable; excluded from roster", p.name,
+            )
+            continue
         desc = (p.description or "").strip()
         roster.append({
             "name": p.name,
             "description": desc or f"(no description; profile named {p.name!r})",
             "has_description": bool(desc),
         })
-    return roster, {p.name for p in all_profiles}
+    return roster, {entry["name"] for entry in roster}
 
 
 def _format_roster(roster: list[dict]) -> str:
@@ -312,6 +350,24 @@ def decompose_task(
     task, reason = _load_triage_task(task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
+
+    # A profile outside kanban auto-routing is outside it in BOTH directions: it never
+    # receives fan-out, and its own tasks are never fanned out. Without this, an
+    # externally-created request would be decomposed and handed to internal workers — the
+    # reverse of the leak _build_roster() prevents, and just as bad. Gating here rather than
+    # in the watcher covers all three callers (CLI, dashboard, auto-decompose tick) at one
+    # point. Unknown creators stay permissive: created_by falls back to "worker" when the
+    # profile is unresolvable, and this is an explicit opt-out, not an allowlist (fork 56fb13ec62).
+    creator = (getattr(task, "created_by", None) or "").strip()
+    if creator and not _is_auto_assignable(creator):
+        return DecomposeOutcome(
+            task_id,
+            False,
+            f"task was created by {creator!r}, which is outside kanban auto-routing "
+            f"(kanban_auto_assignable: false in its profile.yaml); decomposing it would fan "
+            f"an externally-sourced request out to internal workers. If this work should be "
+            f"picked up, re-file it from an internal profile.",
+        )
 
     routing = _load_routing(root_assignee=task.assignee)
     raw, reason = _call_aux(

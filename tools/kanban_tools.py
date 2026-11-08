@@ -1127,6 +1127,15 @@ def _handle_create(args: dict, **kw) -> str:
                       or (self_task.session_id if self_task else None)
                       or _persisted_session_id(_current_origin_session_id())
                       or _persisted_session_id(get_session_env("HERMES_SESSION_ID", "")))
+        # Security stamp: the verified end-user UID comes ONLY from the trusted
+        # session context (gateway-bound ContextVar) or, for a fan-out child, the
+        # creating task's durable row. There is deliberately no ``origin_user``
+        # tool arg — an injected creator must not be able to forge the origin.
+        origin_user = (
+            (get_session_env("HERMES_SESSION_USER_ID", "") or "").strip()
+            or ((self_task.origin_user or "").strip() if self_task else "")
+            or None
+        )
         if project_id is None and workspace_kind is None and workspace_path is None:
             if self_task is not None and self_task.project_id:
                 project_id, project_source_task_id = self_task.project_id, self_task.id
@@ -1146,7 +1155,8 @@ def _handle_create(args: dict, **kw) -> str:
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
             initial_status=str(args.get("initial_status") or "running"),
-            created_by=_persisted_identity(), session_id=session_id)
+            created_by=_persisted_identity(), session_id=session_id,
+            origin_user=origin_user)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}

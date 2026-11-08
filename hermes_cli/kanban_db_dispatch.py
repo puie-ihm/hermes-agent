@@ -2796,6 +2796,9 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     from gateway.session_context import _VAR_MAP
     for key in _VAR_MAP:
         env.pop(key, None)
+    # Origin identity is per-task, never inherited: a dispatcher that was itself
+    # launched under a buyer session must not hand that UID to an unrelated card.
+    env.pop("HERMES_ORIGIN_USER", None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml:
     # without it the child's get_hermes_home() falls back to the DEFAULT
@@ -2810,6 +2813,10 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    # Verified DM end-user UID stamped at create time. Only set when present: an
+    # empty value would read as "some user" to a per-buyer scope guard.
+    if task.origin_user:
+        env["HERMES_ORIGIN_USER"] = task.origin_user
     # Tag the session `kanban` so session-browsing surfaces filter it out by
     # source instead of rendering one sidebar row per attempt.
     env["HERMES_SESSION_SOURCE"] = "kanban"

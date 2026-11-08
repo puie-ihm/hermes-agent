@@ -3838,6 +3838,26 @@ class SlackAdapter(BasePlatformAdapter):
         self._evict_oldest_by_ts(
             self._titled_assistant_threads, self._TITLED_ASSISTANT_THREADS_MAX, lambda e: e[2])
 
+    @staticmethod
+    def _session_chat_type(channel_id: str, is_dm: bool) -> str:
+        """Session-key ``chat_type`` — DELIBERATELY DISTINCT from the routing ``is_dm``.
+
+        ``is_dm`` (``channel_type in {"im","mpim"}``) drives routing / reaction /
+        security GATING, where an MPIM (group DM) is correctly treated as a
+        persistent DM-style surface. That gating MUST NOT change.
+
+        For the SESSION KEY an MPIM is a SHARED, multi-party surface and must key
+        as ``"group"`` — exactly like the slash-command and
+        ``_has_active_session_for_thread`` paths already do. Keying MPIMs off
+        ``is_dm`` split the SAME thread across two session keys: a plain
+        ``message`` event (``channel_type="mpim"`` → ``is_dm``) landed on
+        ``slack:dm:…`` while an ``app_mention`` (no ``channel_type``, C/G-prefixed
+        → not ``is_dm``) landed on ``slack:group:…``, so the bot "forgot"
+        mid-thread. Only a genuine 1:1 DM (``im`` + D-prefix) keys as ``"dm"``;
+        every other surface (mpim, channel) keys as ``"group"``.
+        """
+        return "dm" if is_dm and channel_id.startswith("D") else "group"
+
     def _seed_dm_session(
         self, metadata: dict[str, str], *, thread_ts: Optional[str], fail_log: tuple[Any, ...]
     ) -> None:
@@ -3850,7 +3870,7 @@ class SlackAdapter(BasePlatformAdapter):
             chat_id=channel_id,
             chat_name=self._channel_name_cache.get(
                 (str(metadata.get("team_id") or ""), channel_id), channel_id),
-            chat_type="dm",
+            chat_type=self._session_chat_type(channel_id, True),
             user_id=user_id,
             thread_id=thread_ts,
             chat_topic=metadata.get("context_channel_id") or None,
@@ -4299,7 +4319,7 @@ class SlackAdapter(BasePlatformAdapter):
             return await self._should_wake_on_unmentioned_message(
                 event_thread_ts=event_thread_ts, channel_id=channel_id, user_id=user_id,
                 team_id=team_id, is_thread_reply=is_thread_reply,
-                chat_type="dm" if is_dm else "group")
+                chat_type=self._session_chat_type(channel_id, is_dm))
         return True
 
     def _normalize_changed_message(self, event: dict) -> Optional[dict]:
@@ -4455,13 +4475,13 @@ class SlackAdapter(BasePlatformAdapter):
             return channel_context, thread_root_media_urls, thread_root_media_types
         has_active_thread_session = self._has_active_session_for_thread(
             channel_id=channel_id, thread_ts=event_thread_ts, user_id=user_id, team_id=team_id,
-            chat_type="dm" if is_dm else "group")
+            chat_type=self._session_chat_type(channel_id, is_dm))
 
         async def _fetch(**kw) -> None:
             nonlocal channel_context
             thread_context = await self._fetch_thread_context(
                 channel_id=channel_id, thread_ts=event_thread_ts, current_ts=ts, team_id=team_id,
-                chat_type="dm" if is_dm else "group", **kw)
+                chat_type=self._session_chat_type(channel_id, is_dm), **kw)
             if thread_context:
                 channel_context = thread_context
 
@@ -4811,7 +4831,7 @@ class SlackAdapter(BasePlatformAdapter):
         source = self.build_source(
             chat_id=channel_id,
             chat_name=channel_name,
-            chat_type="dm" if is_dm else "group",
+            chat_type=self._session_chat_type(channel_id, is_dm),
             user_id=user_id,
             user_name=user_name,
             thread_id=thread_ts,
@@ -6213,7 +6233,8 @@ class SlackAdapter(BasePlatformAdapter):
         if rejected and not is_dm:
             return
         source = self.build_source(
-            chat_id=channel_id, chat_type="dm" if is_dm else "group", user_id=user_id,
+            chat_id=channel_id, chat_type=self._session_chat_type(channel_id, is_dm),
+            user_id=user_id,
             thread_id=thread_id, scope_id=team_id or None)
         from gateway.platforms.base import resolve_channel_skills
         event = MessageEvent(

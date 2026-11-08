@@ -1688,7 +1688,7 @@ class SlackAdapter(BasePlatformAdapter):
     def _register_bolt_handlers(self) -> None:
         """Wire every Bolt listener onto ``self._app``; must run before Socket Mode starts."""
         # Bolt injects listener args by NAME (None for unknown), so every handler takes
-        # (event, say, body). message + app_mention share an event ts, so the deduplicator drops
+        # (event, say, body, ack). message + app_mention share an event ts, so the deduplicator drops
         # the second. file_created/file_change are acked (no-op) to avoid "unhandled request" noise.
         async def _noop(event, body):
             return None
@@ -1700,7 +1700,14 @@ class SlackAdapter(BasePlatformAdapter):
             return _handler
 
         def _listener_for(handler):
-            async def _listener(event, say, body):
+            async def _listener(event, say, body, ack):
+                # Socket Mode envelope ack: slack-bolt only sends the WebSocket ack to Slack when
+                # the listener calls ``await ack()``; otherwise it waits for the listener to return.
+                # This listener runs the relevance filter, media downloads and the whole agent turn
+                # before returning, so without an explicit early ack the envelope can sit unacked for
+                # minutes and Slack redelivers it (same-ts replay → second reply). Ack FIRST, then
+                # work; the deduplicator suppresses any replay that still arrives.
+                await ack()
                 await handler(event, body)
 
             return _listener

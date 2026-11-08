@@ -86,6 +86,22 @@ def _make_adapter(extra: dict) -> SlackAdapter:
     return adapter
 
 
+@pytest.fixture(autouse=True)
+def _clean_slack_env(monkeypatch):
+    """Isolate these tests from the operator box's exported Slack config.
+
+    The gateway host exports SLACK_ALLOWED_USERS / SLACK_DM_ALLOWED_USERS /
+    SLACK_ALLOW_ALL_USERS into the process environment (systemd
+    EnvironmentFile), and the scope-aware readers fall back to os.environ for
+    the default profile — so without this every allowlist assertion below
+    inherits the live allowlist and passes/fails for the wrong reason. Each
+    test sets exactly the vars it needs.
+    """
+    for var in ("SLACK_ALLOWED_USERS", "SLACK_DM_ALLOWED_USERS", "SLACK_ALLOW_ALL_USERS",
+                "SLACK_THREAD_FOLLOWUP_MODE", "SLACK_STRICT_MENTION"):
+        monkeypatch.delenv(var, raising=False)
+
+
 # ---- config parsing -------------------------------------------------------
 
 def test_followup_mode_agent_parsed(monkeypatch):
@@ -107,10 +123,20 @@ def test_followup_mode_env_fallback(monkeypatch):
     assert a._thread_followup_mode() == "agent"
 
 
-def test_followup_mode_config_overrides_env(monkeypatch):
+def test_followup_mode_env_overrides_config(monkeypatch):
+    """Precedence follows the ONE per-profile setting reader (env → YAML).
+
+    The fork read ``config.extra`` first; v0.23.0 routes every platform knob
+    through ``gateway.platforms._shared.extra_or_secret``, whose documented
+    contract is explicit env → profile YAML → default (same as
+    ``SLACK_REACTIONS``, ``SLACK_REQUIRE_MENTION``). Keeping one reader for
+    every knob beats a fork-only precedence for one key; in production
+    ``SLACK_THREAD_FOLLOWUP_MODE`` is unset and ``slack.thread_followup_mode:
+    agent`` in config.yaml wins anyway.
+    """
     monkeypatch.setenv("SLACK_THREAD_FOLLOWUP_MODE", "off")
     a = _make_adapter({"thread_followup_mode": "agent"})
-    assert a._thread_followup_mode() == "agent"
+    assert a._thread_followup_mode() == "off"
 
 
 # ---- _in_bot_thread participation check -----------------------------------

@@ -3241,6 +3241,21 @@ class SlackAdapter(BasePlatformAdapter):
         self, channel: str, timestamp: str, emoji: str, team_id: str = "") -> bool:
         return await self._react(channel, timestamp, emoji, team_id, remove=True)
 
+    async def _apply_decision_reaction(self, event, emoji: str) -> bool:
+        """React to the trigger message with a single emoji (agent-decision
+        ``[[react:emoji]]`` path). Independent of the eyes→check lifecycle gate.
+
+        Called from ``BasePlatformAdapter._consume_decision_sentinels`` — the
+        shared egress filter — so it must tolerate a synthetic event
+        (``SimpleNamespace`` carrying only ``message_id`` + ``source.chat_id``)
+        as well as a real ``MessageEvent``.
+        """
+        ts = getattr(event, "message_id", None)
+        channel_id = getattr(getattr(event, "source", None), "chat_id", None)
+        if not ts or not channel_id:
+            return False
+        return await self._add_reaction(channel_id, ts, emoji)
+
     def _reactions_enabled(self) -> bool:
         """Whether message reactions are enabled (scoped ``SLACK_REACTIONS`` → ``extra.reactions`` → on)."""
         configured = _extra_or_secret(self.config.extra, "reactions", "SLACK_REACTIONS", "true")
@@ -6230,6 +6245,81 @@ class SlackAdapter(BasePlatformAdapter):
                 "set_session_metadata", channel_id, thread_ts, user_id, team_id, watermark_ts)
         except Exception:
             logger.debug("[Slack] Failed to persist thread watermark", exc_info=True)
+
+    def _thread_followup_mode(self) -> str:
+        """Thread follow-up mode: ``agent`` lets the model decide reply /
+        ``[[react:emoji]]`` / ``[[silent]]`` on non-mention follow-ups inside
+        threads the bot already participates in.
+
+        Default ``off`` preserves ``strict_mention``'s drop-non-mention
+        behaviour. ``slack.thread_followup_mode`` wins over
+        ``SLACK_THREAD_FOLLOWUP_MODE``.
+        """
+        configured = _extra_or_secret(
+            self.config.extra, "thread_followup_mode", "SLACK_THREAD_FOLLOWUP_MODE", "off")
+        return str(configured).lower().strip()
+
+    def _slack_known_human_ids(self) -> set:
+        """Human user IDs this bot serves, from the channel and DM allowlists.
+
+        Read through the scope-aware secret reader (not ``os.getenv``): under
+        multiplex a secondary profile must see ITS OWN allowlists, never the
+        launch process's — which holds the default profile's bridged values.
+        """
+        ids: set = set()
+        for var in ("SLACK_ALLOWED_USERS", "SLACK_DM_ALLOWED_USERS"):
+            raw = _get_scoped_secret(var, "") or ""
+            ids.update(part.strip() for part in str(raw).split(",") if part.strip())
+        return ids
+
+    def _is_bot_authored_followup(self, event: dict) -> bool:
+        """True when a thread follow-up was authored by a bot/app, not by a human.
+
+        ``bot_id`` is NOT proof that a bot wrote the message. Slack stamps it on
+        messages posted with an app's *user* token as well, and those carry the
+        human in ``user`` too. Measured 2026-09-19 in #agent-monitoring: a
+        user-token post arrived as ``user=U028TNBPA22 + bot_id=B0B1T07L1NG +
+        app_id=<this same app>``, the circuit-breaker counted it as a bot turn,
+        and the thread went silent on the fourth message — with no error, just
+        a bot that stops answering. A sender we know as a human is never bot
+        traffic, whatever Slack stamped on the envelope.
+        """
+        if event.get("subtype") == "bot_message":
+            return True
+        if not event.get("bot_id"):
+            return False
+        user_id = str(event.get("user") or "").strip()
+        if not user_id:
+            return True
+        if user_id in self._slack_known_human_ids():
+            return False
+        if str(_get_scoped_secret("SLACK_ALLOW_ALL_USERS", "") or "").strip().lower() in {"true", "1", "yes", "on"}:
+            return False
+        return True
+
+    def _in_bot_thread(self, event_thread_ts, channel_id, user_id, is_thread_reply,
+                       team_id: str = "", chat_type: str = "group") -> bool:
+        """True when this is a thread reply in a thread the bot started, was
+        @-mentioned in, or has an active session for.
+
+        ``team_id`` / ``chat_type`` are forwarded to the session lookup when the
+        caller has them: upstream's ``_has_active_session_for_thread`` builds the
+        session key from both, and MPIM channel IDs start with ``G`` so
+        ``chat_type`` must come from the event's ``channel_type``, never the
+        channel-ID prefix. Omitting them keeps the fork's 4-arg contract working
+        (the defaults match the DM/group case).
+        """
+        if not is_thread_reply or not event_thread_ts:
+            return False
+        if event_thread_ts in self._bot_message_ts or event_thread_ts in self._mentioned_threads:
+            return True
+        try:
+            return self._has_active_session_for_thread(
+                channel_id=channel_id, thread_ts=event_thread_ts, user_id=user_id,
+                team_id=team_id, chat_type=chat_type,
+            )
+        except Exception:
+            return False
 
     def _has_active_session_for_thread(
         self, channel_id: str, thread_ts: str, user_id: str, team_id: str = "", *,

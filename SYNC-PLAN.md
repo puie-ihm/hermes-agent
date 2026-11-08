@@ -47,6 +47,7 @@ a clean cutover would silently drop them.
 | minimax-oauth auxiliary branch | present upstream (38 hits) — likely obsolete | agent/auxiliary_client.py |
 | Per-platform DM allowlist | 0 hits (`PLATFORM_DM_ALLOWED_USERS` absent in both) | gateway/ |
 | Holographic memory in core | removed upstream → catalog plugin | plugins/memory/ |
+| Holographic scaffolding rejection (`_is_storable_memory_text` / `_strip_leading_author_prefix`, fork cherry-picks `d4797d7115` + `2fa5763d10`) | absent from catalog plugin v0.26.5 | was `plugins/memory/holographic/__init__.py` |
 
 The 36 fork commits are a **feature fork**, not a patch queue: many are labelled
 "cherry-pick from <sha>" where that sha never landed on upstream main
@@ -78,12 +79,52 @@ The 36 fork commits are a **feature fork**, not a patch queue: many are labelled
    `tests/hermes_cli/test_kanban_db.py`, `tests/tools/test_kanban_redaction.py`.
 5. **Jev triage feature**: port `agent/jev_triage.py` + wiring (it is fork-only,
    ~321 lines; may need redesign against the new turn loop).
+   **DONE** — the module and its 23 tests survived the merge byte-identical; only
+   the call site was lost with the `_channel_gate_allows` rewrite. Re-attached as
+   `_agent_followup_gate()` (see the commit for why a separate gate, not an
+   inline branch). 15 new tests execute the gate.
 6. **Holographic memory**: install the catalog plugin, verify the existing
    fact store still loads (176 facts), confirm `fact_store` tool still registers.
+   **DONE** — catalog install (`plugin-catalog/holographic.yaml`, live pin
+   v0.26.5 / `f75c636a28`) verified in an isolated home: provider loads,
+   `fact_store` + `fact_feedback` register, and the existing store reads back
+   **177** facts (the card's 176 was a point-in-time count; one fact was added
+   2026-11-08). No in-tree `plugins/memory/holographic/` may exist on the
+   branch: a bundled dir wins over the user-installed plugin
+   (`plugins/memory/__init__.py` precedence) and a partial copy shadows the
+   catalog install while failing to import its `store` submodule.
+   **Open gap (verified):** the catalog plugin does not carry the fork's
+   `_is_storable_memory_text` / `_strip_leading_author_prefix` guards —
+   `_auto_extract_facts` stores Slack scaffolding verbatim (feeding it the
+   SCAFFOLDED fixture added a fact containing `[Replying to: …]` /
+   `[Thread context …]`; the live store already holds several such rows). The
+   fork's `tests/plugins/memory/test_holographic_auto_extract.py` was deleted
+   here — the module it imports left core, so it could only error at
+   collection; upstream v0.23.0 does not carry it either.
 7. **Config migration**: `hermes config migrate`, diff the resulting config for
    silent key drops; verify cron jobs (RPL 09:00 BKK, Acceptance, WBRR) still load.
 
 ## Cutover (only after the branch is green)
+
+0. **Holographic plugin, per profile home — do this BEFORE the first start.**
+   Every profile home configures `memory.provider: holographic` and none ships
+   the provider (it left core upstream), so a start on v0.23.0 finds no provider
+   until the catalog plugin is installed. `hermes update` / agent init will
+   migrate the home it runs under, but NOT the 8 sibling profile homes — install
+   it into each one:
+
+   ```
+   for p in default tech_agent buyer_ops data_analyst ext_data_analyst \
+            affiliate_mgr media_buyer legal_reviewer front_external; do
+       hermes -p "$p" plugins install holographic     # idempotent per home
+   done
+   ```
+
+   All of them share one store (`~/.hermes/memory_store.db`), so the install is
+   code-only; there is nothing to migrate. Confirmed absent today:
+   `ls ~/.hermes/plugins/holographic` and the same under every profile home.
+   Verify after each: `hermes -p <profile> memory status` shows the provider
+   loaded and the fact count.
 
 1. Freeze: confirm no long agent run in flight.
 2. `git checkout main && git merge --ff-only sync/v0.23.0` in the live tree.
@@ -96,8 +137,9 @@ The 36 fork commits are a **feature fork**, not a patch queue: many are labelled
 ## Verification checklist
 
 - [ ] `python -m pytest tests/ -o 'addopts=' -q` green (or documented pre-existing fails)
-- [ ] sentinel/dedup/triage tests green
-- [ ] kanban governance tests green
-- [ ] holographic fact store loads, `fact_store` reachable
+- [x] sentinel/dedup/triage tests green
+- [x] kanban governance tests green
+- [x] holographic fact store loads, `fact_store` reachable (isolated home; the
+  live-home install is cutover step 0)
 - [ ] opencode-go request path works (one live model call)
 - [ ] gateway restart + Slack DM round-trip

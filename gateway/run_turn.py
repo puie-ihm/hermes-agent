@@ -2225,6 +2225,19 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
             pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
             if pending_event or pending:
+                # Agent-decision sentinels ([[silent]] / [[react:emoji]]): the queued lane sends this
+                # first response itself and never reaches base.py's send chokepoint, so parse here as
+                # well. Regression: a queued follow-up with streaming.enabled=false posted a literal
+                # [[react:eyes]] into the channel. Same shared filter, both egress paths.
+                _consume_sentinels = getattr(adapter, "_consume_decision_sentinels", None)
+                if callable(_consume_sentinels):
+                    for _holder in (result, response):
+                        if isinstance(_holder, dict) and _holder.get("final_response"):
+                            _holder["final_response"] = await _consume_sentinels(
+                                _holder["final_response"],
+                                chat_id=getattr(source, "chat_id", None),
+                                message_id=turn_ctx.event_message_id,
+                            ) or ""
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,
                 )

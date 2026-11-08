@@ -18,6 +18,7 @@ import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
+from types import SimpleNamespace
 from hermes_dir_acl import make_user_dir, unusable_dir_remedy
 from gateway.platforms.base_log_safety import safe_url_for_log
 
@@ -1216,6 +1217,11 @@ _MEDIA_CJK_TERMINATORS = "（）〈〉《》：，。；！？、\u201c\u201d\u2
 MD_IMAGE_TAG_PATTERN = r'!\[([^\]]*)\]\((https?://[^\s\)]+)\)'
 HTML_IMAGE_TAG_PATTERN = r'<img\s+src=["\']?(https?://[^\s"\'<>]+)["\']?\s*/?>\s*(?:</img>)?'
 _IMAGE_URL_MARKERS = ('.png', '.jpg', '.jpeg', '.gif', '.webp', 'fal.media', 'fal-cdn', 'replicate.delivery')
+
+# Agent-decision sentinel (``[[react:emoji]]``) — a RESERVED control token, parsed on every egress
+# path by ``_consume_decision_sentinels``. Accepts ``[[react:+1]]``, ``[[react::thumbsup:]]``
+# (model wrapped the emoji in colons) and ``[[react: white_check_mark ]]`` (stray spaces).
+_DECISION_REACT_RE = re.compile(r"\[\[react:\s*:?([a-z0-9_+\-]+):?\s*\]\]")
 
 MEDIA_TAG_CLEANUP_RE = re.compile(
     r'''[`"'*_]{0,3}MEDIA:\s*'''
@@ -3483,6 +3489,53 @@ class BasePlatformAdapter(ABC):
             ttl = 0
         return response.text, int(ttl or 0)
 
+    async def _consume_decision_sentinels(
+        self, response: Any, event: Any = None, chat_id: Optional[str] = None,
+        message_id: Optional[str] = None,
+    ) -> Optional[Any]:
+        """Single egress filter for agent-decision control tokens (``[[silent]]`` /
+        ``[[react:emoji]]``, used by ``slack.thread_followup_mode=agent``).
+
+        Returns the text to actually send, or ``None`` when the whole response is a
+        control token (in which case it fires the emoji reaction as a side effect).
+        This MUST be called by EVERY egress path — the chokepoint in
+        ``_process_message_background`` AND the queued-follow-up resend in
+        ``run_turn._run_agent_inner`` — so a raw token can never leak into the channel
+        as visible text. (Regression: a literal ``[[react:eyes]]`` was posted because
+        the queued-follow-up resend bypassed the chokepoint parser.)
+
+        Parsing is UNCONDITIONAL — never gated on the turn being a triage turn: the
+        model may emit these in any turn (e.g. a direct @-mention it decides not to
+        answer), and the token is reserved either way.
+
+        Pass ``event`` when available (chokepoint); otherwise pass ``chat_id`` and
+        ``message_id`` (resend path, which only has the ``SessionSource``).
+        """
+        if not response or not isinstance(response, str):
+            return response
+        if "[[silent]]" in response:
+            logger.info("[%s] Agent chose [[silent]] — suppressing reply", self.name)
+            return None
+        match = _DECISION_REACT_RE.search(response)
+        if not match:
+            return response
+        emoji = match.group(1)
+        logger.info("[%s] Agent chose [[react:%s]] — reacting only", self.name, emoji)
+        apply_reaction = getattr(self, "_apply_decision_reaction", None)
+        if apply_reaction is not None:
+            target = event
+            if target is None and (chat_id or message_id):
+                target = SimpleNamespace(
+                    message_id=message_id,
+                    source=SimpleNamespace(chat_id=chat_id),
+                )
+            if target is not None:
+                try:
+                    await apply_reaction(target, emoji)
+                except Exception as exc:  # a reaction failure must not eat the turn
+                    logger.debug("[%s] decision reaction failed: %s", self.name, exc)
+        return None
+
     async def _dispatch_inline_reply(self, event: MessageEvent, *, log_cmd: Optional[str] = None) -> None:
         """Call the handler and send its reply inline, with retry, threading and
         ephemeral deletion — no session lifecycle (active-session bypass paths)."""
@@ -4495,6 +4548,13 @@ class BasePlatformAdapter(ABC):
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             else:
+                # Agent-decision sentinels ([[silent]] / [[react:emoji]]) — RESERVED control tokens,
+                # parsed unconditionally on every turn: a model can emit them even in a direct
+                # @-mention turn it decides not to answer, and a raw token must never reach the
+                # channel as visible text. The queued-follow-up resend in run_turn applies the same
+                # filter (see _consume_decision_sentinels) so both egress paths agree.
+                response = await self._consume_decision_sentinels(response, event=event)
+            if response:
                 extracted = await self._extract_response_content(
                     response, event, session_key, is_ephemeral_response=is_ephemeral_response)
                 text_content, media_files = extracted.text_content, extracted.media_files

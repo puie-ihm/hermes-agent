@@ -15,7 +15,7 @@ Mirrors the mock/bootstrap pattern in test_slack_mention.py.
 
 import re
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -347,3 +347,192 @@ def test_bot_message_subtype_is_bot_even_with_human_user(monkeypatch):
     monkeypatch.setenv("SLACK_ALLOWED_USERS", HUMAN)
     a = _make_adapter({"thread_followup_mode": "agent"})
     assert a._is_bot_authored_followup({"user": HUMAN, "subtype": "bot_message"}) is True
+
+
+# ---- agent follow-up gate: Jev triage wiring -------------------------------
+#
+# These execute the gate, they do not grep for its call site. The gate is what
+# the fork's inline `_agent_mode and _in_thread` branch became after upstream
+# rewrote the routing: on an unmentioned reply inside a thread the bot already
+# participates in, Jev decides silent / react / reply before a full LLM turn is
+# spent. Fail-open is the safety property — every failure mode must return True
+# (continue on the model path).
+
+import asyncio  # noqa: E402
+
+from agent import jev_triage  # noqa: E402
+
+THREAD = "1700000000.000100"
+TS = "1700000000.000200"
+
+
+def _make_gated_adapter(extra=None):
+    a = _make_adapter(extra or {"thread_followup_mode": "agent", "strict_mention": True})
+    a._bot_message_ts.add(THREAD)
+    a._followup_bot_turns = {}
+    a._has_active_session_for_thread = MagicMock(return_value=False)
+
+    async def _ctx(*_a, **_kw):
+        return ""
+
+    a._fetch_thread_context = _ctx
+    a._add_reaction = AsyncMock()
+    return a
+
+
+def _gate(a, *, event=None, text="hello", is_mentioned=False, is_thread_reply=True,
+          channel_id="C1"):
+    return asyncio.run(a._agent_followup_gate(
+        event=event if event is not None else {"user": HUMAN, "ts": TS},
+        channel_id=channel_id, ts=TS, event_thread_ts=THREAD, team_id="T1",
+        text=text, is_mentioned=is_mentioned, is_thread_reply=is_thread_reply,
+        user_id=HUMAN, is_dm=False))
+
+
+def _fake_jev(monkeypatch, *, enabled=True, action=None, confidence=0.9, calls=None):
+    monkeypatch.setattr(jev_triage, "is_enabled", lambda: enabled)
+    monkeypatch.setattr(jev_triage, "react_emoji", lambda: "+1")
+
+    def _decide(message, **kwargs):
+        if calls is not None:
+            calls.append((message, kwargs))
+        return jev_triage.TriageDecision(
+            action=action, confidence=confidence, reason="test", latency_ms=1)
+
+    monkeypatch.setattr(jev_triage, "decide_followup", _decide)
+
+
+def test_gate_off_by_default_does_not_consult_jev(monkeypatch):
+    calls = []
+    _fake_jev(monkeypatch, action="silent", calls=calls)
+    a = _make_gated_adapter({"strict_mention": True})   # followup_mode defaults to off
+    assert _gate(a) is True
+    assert calls == []
+
+
+def test_gate_skips_a_mentioned_message(monkeypatch):
+    calls = []
+    _fake_jev(monkeypatch, action="silent", calls=calls)
+    a = _make_gated_adapter()
+    assert _gate(a, is_mentioned=True) is True
+    assert calls == []
+
+
+def test_gate_skips_free_response_channel(monkeypatch):
+    calls = []
+    _fake_jev(monkeypatch, action="silent", calls=calls)
+    a = _make_gated_adapter({"thread_followup_mode": "agent",
+                             "strict_mention": True,
+                             "free_response_channels": ["C1"]})
+    assert _gate(a) is True
+    assert calls == []
+
+
+def test_gate_skips_when_require_mention_is_off(monkeypatch):
+    calls = []
+    _fake_jev(monkeypatch, action="silent", calls=calls)
+    a = _make_gated_adapter({"thread_followup_mode": "agent", "require_mention": False})
+    assert _gate(a) is True
+    assert calls == []
+
+
+def test_gate_skips_thread_the_bot_is_not_in(monkeypatch):
+    calls = []
+    _fake_jev(monkeypatch, action="silent", calls=calls)
+    a = _make_gated_adapter()
+    a._bot_message_ts.clear()
+    assert _gate(a) is True
+    assert calls == []
+
+
+def test_gate_silent_drops_the_turn(monkeypatch):
+    calls = []
+    _fake_jev(monkeypatch, action="silent", calls=calls)
+    a = _make_gated_adapter()
+    assert _gate(a, text="เดี๋ยวผมคุยกับทีมก่อนนะ") is False
+    assert calls and calls[0][0] == "เดี๋ยวผมคุยกับทีมก่อนนะ"
+    a._add_reaction.assert_not_called()
+
+
+def test_gate_react_adds_the_emoji_and_drops_the_turn(monkeypatch):
+    _fake_jev(monkeypatch, action="react")
+    a = _make_gated_adapter()
+    assert _gate(a, text="ขอบคุณครับ") is False
+    a._add_reaction.assert_called_once_with("C1", TS, "+1", "T1")
+
+
+def test_gate_react_is_dropped_but_not_reacted_when_reactions_are_off(monkeypatch):
+    _fake_jev(monkeypatch, action="react")
+    a = _make_gated_adapter({"thread_followup_mode": "agent", "strict_mention": True,
+                             "reactions": False})
+    assert _gate(a) is False
+    a._add_reaction.assert_not_called()
+
+
+def test_gate_no_decision_falls_through_to_the_model(monkeypatch):
+    _fake_jev(monkeypatch, action=None)
+    a = _make_gated_adapter()
+    assert _gate(a, text="LaHermes ช่วยสรุปให้หน่อย") is True
+
+
+def test_gate_is_inert_when_jev_is_disabled(monkeypatch):
+    calls = []
+    _fake_jev(monkeypatch, enabled=False, action="silent", calls=calls)
+    a = _make_gated_adapter()
+    assert _gate(a) is True
+    assert calls == []
+
+
+def test_gate_failure_never_silences_the_bot(monkeypatch):
+    monkeypatch.setattr(jev_triage, "is_enabled", lambda: True)
+    monkeypatch.setattr(jev_triage, "react_emoji", lambda: "+1")
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("typesafe down")
+
+    monkeypatch.setattr(jev_triage, "decide_followup", _boom)
+    a = _make_gated_adapter()
+    assert _gate(a) is True
+
+
+def test_thread_context_fetch_failure_still_decides(monkeypatch):
+    calls = []
+    _fake_jev(monkeypatch, action="silent", calls=calls)
+    a = _make_gated_adapter()
+
+    async def _ctx(*_a, **_kw):
+        raise RuntimeError("slack api down")
+
+    a._fetch_thread_context = _ctx
+    assert _gate(a) is False
+    assert calls and calls[0][1].get("thread_context") == ""
+
+
+def test_bot_authored_followup_keeps_the_model_path(monkeypatch):
+    calls = []
+    _fake_jev(monkeypatch, action="silent", calls=calls)
+    a = _make_gated_adapter()
+    event = {"bot_id": "B0AJB4857TJ", "text": "ok", "ts": TS}
+    assert _gate(a, event=event) is True
+    assert calls == []
+
+
+def test_circuit_breaker_trips_after_three_bot_turns(monkeypatch):
+    calls = []
+    _fake_jev(monkeypatch, action=None, calls=calls)
+    a = _make_gated_adapter()
+    event = {"bot_id": "B0AJB4857TJ", "text": "ok", "ts": TS}
+    assert [_gate(a, event=event) for _ in range(3)] == [True, True, True]
+    assert _gate(a, event=event) is False
+    assert calls == []   # bot traffic never reaches Jev
+
+
+def test_a_human_turn_resets_the_circuit_breaker(monkeypatch):
+    _fake_jev(monkeypatch, action=None)
+    a = _make_gated_adapter()
+    bot_event = {"bot_id": "B0AJB4857TJ", "text": "ok", "ts": TS}
+    for _ in range(3):
+        _gate(a, event=bot_event)
+    assert _gate(a, event={"user": HUMAN, "ts": TS}) is True   # human resets
+    assert [_gate(a, event=bot_event) for _ in range(3)] == [True, True, True]
+

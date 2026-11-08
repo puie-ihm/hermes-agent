@@ -4336,6 +4336,123 @@ class SlackAdapter(BasePlatformAdapter):
                 chat_type=self._session_chat_type(channel_id, is_dm))
         return True
 
+    # ── Agent follow-up gate (fork: slack.thread_followup_mode=agent) ──────
+    #
+    # The fork ran this block inline in its mention-gating chain. Upstream's
+    # rewrite centralised the gates in ``_channel_gate_allows`` and dropped the
+    # branch, so the helpers it needs (``_thread_followup_mode``,
+    # ``_in_bot_thread``, ``_is_bot_authored_followup``) survived as dead code.
+    # It is re-attached here as a separate gate because it is NOT a mention
+    # rule: it decides whether to spend a turn at all, and it can emit a
+    # reaction. Behaviour is the spec, not the old call site.
+
+    def _agent_followup_applies(
+            self, *, event: dict, channel_id: str, event_thread_ts, team_id: str,
+            is_mentioned: bool, is_thread_reply: bool, user_id: str,
+            is_dm: bool) -> bool:
+        """True for exactly the message class the fork's agent branch owned: an
+        unmentioned reply inside a thread the bot already participates in, in a
+        mention-gated channel, with ``thread_followup_mode=agent``.
+
+        The three exclusions mirror the fork's elif ordering — a free-response
+        channel, ``require_mention: false``, or an actual @mention each took an
+        earlier branch there, so Jev must not preempt them here either.
+        """
+        if is_mentioned or not is_thread_reply or not event_thread_ts:
+            return False
+        if self._thread_followup_mode() != "agent":
+            return False
+        if self._slack_is_free_channel(channel_id):
+            return False
+        if not self._slack_require_mention():
+            return False
+        return self._in_bot_thread(
+            event_thread_ts, channel_id, user_id, is_thread_reply,
+            team_id=team_id or "", chat_type=self._session_chat_type(channel_id, is_dm))
+
+    async def _agent_followup_gate(
+            self, *, event: dict, channel_id: str, ts: str, event_thread_ts, team_id: str,
+            text: str, is_mentioned: bool, is_thread_reply: bool, user_id: str,
+            is_dm: bool) -> bool:
+        """Pre-turn gate for agent-mode follow-ups. False = drop here.
+
+        Two guards run, both fork behaviour:
+
+        1. Bot-ack circuit breaker — cap consecutive bot-originated turns per
+           thread so two agents cannot ping-pong acknowledgements forever. A
+           human turn resets the counter. ``_is_bot_authored_followup`` rather
+           than a bare ``bot_id`` check: Slack stamps ``bot_id`` on human posts
+           made through an app *user* token, which silenced a live thread on
+           the fourth message.
+        2. Jev triage (``agent/jev_triage.py``) — a typed classifier decides
+           silent / react / reply for ~$0.00002 and ~0.9s instead of a full LLM
+           turn (~$0.002-0.005, 1-5s) that could also decide to answer a
+           different conversation. Fail-open by design: disabled, slow,
+           erroring or unsure all return ``action=None`` and fall through to
+           the model path, so this can never silence the bot on its own.
+        """
+        if not self._agent_followup_applies(
+                event=event, channel_id=channel_id, event_thread_ts=event_thread_ts,
+                team_id=team_id, is_mentioned=is_mentioned,
+                is_thread_reply=is_thread_reply, user_id=user_id, is_dm=is_dm):
+            return True
+
+        is_bot_msg = self._is_bot_authored_followup(event)
+        breaker = getattr(self, "_followup_bot_turns", None)
+        if breaker is None:
+            breaker = self._followup_bot_turns = {}
+        if is_bot_msg:
+            breaker[event_thread_ts] = breaker.get(event_thread_ts, 0) + 1
+            if breaker[event_thread_ts] > 3:
+                logger.info(
+                    "[Slack] follow-up circuit-breaker tripped for thread %s", event_thread_ts)
+                return False
+            # Bound the dict like _mentioned_threads so bot-only threads (never
+            # reset by a human turn) cannot grow without limit.
+            if len(breaker) > self._MENTIONED_THREADS_MAX:
+                for stale in list(breaker)[:self._MENTIONED_THREADS_MAX // 2]:
+                    breaker.pop(stale, None)
+        else:
+            breaker.pop(event_thread_ts, None)  # a human turn resets the counter
+
+        if is_bot_msg:
+            # Bot-authored traffic keeps the model path: the fork deliberately
+            # spent a turn there so the ack-loop guard above stays exercised.
+            return True
+
+        try:
+            from agent.jev_triage import decide_followup, is_enabled, react_emoji
+
+            if not is_enabled():
+                return True
+            ctx = ""
+            try:
+                ctx = await self._fetch_thread_context(
+                    channel_id, event_thread_ts, ts, team_id=team_id or "", limit=6)
+            except Exception:
+                # Context is an accuracy nicety, not a gate. Deliberately not
+                # contextlib.suppress: an exception here is a code bug and must
+                # not be mistaken for a triage miss.
+                ctx = ""
+            decision = await asyncio.to_thread(
+                decide_followup, text, thread_context=ctx or "")
+            logger.info(
+                "[Slack] jev triage chat=%s ts=%s action=%s confidence=%s latency=%dms "
+                "tokens=%s (%s)",
+                channel_id, ts, decision.action, decision.confidence,
+                decision.latency_ms, decision.tokens, decision.reason)
+            if decision.action == "silent":
+                return False
+            if decision.action == "react":
+                if self._reactions_enabled():
+                    await self._add_reaction(channel_id, ts, react_emoji(), team_id or "")
+                return False
+        except Exception:
+            # warning, not debug: a swallowed failure here silently disabled the
+            # Jev path once already and nothing in the log showed it.
+            logger.warning("[Slack] jev triage failed; using model path", exc_info=True)
+        return True
+
     def _normalize_changed_message(self, event: dict) -> Optional[dict]:
         """Turn a ``message_changed`` envelope into a plain message event.
         None if malformed or the original was already routed to the agent. The edit's own ts rides
@@ -4779,6 +4896,14 @@ class SlackAdapter(BasePlatformAdapter):
             is_mentioned=is_mentioned, is_thread_reply=is_thread_reply,
             event_thread_ts=event_thread_ts, user_id=user_id, team_id=team_id, is_dm=is_dm,
             force_process=force_process)):
+            return
+        # Agent-mode follow-ups only: Jev triage / bot-ack breaker run before the
+        # ts is claimed, so a message we deliberately stay silent on cannot block
+        # a later "@bot" edit from summoning the bot.
+        if not await self._agent_followup_gate(
+                event=event, channel_id=channel_id, ts=ts, event_thread_ts=event_thread_ts,
+                team_id=team_id, text=text, is_mentioned=is_mentioned,
+                is_thread_reply=is_thread_reply, user_id=user_id, is_dm=is_dm):
             return
         # Claim the message ts HERE: a link unfurl emits `message_changed` with a different event
         # ts, so only the `_processed_message_ts` guard stops a duplicate turn, and it must be set

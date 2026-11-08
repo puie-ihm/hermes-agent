@@ -1,4 +1,5 @@
-import { useMemo } from 'react'
+import { randomUuid } from '@hermes/shared'
+import { createContext, useContext, useMemo } from 'react'
 
 import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
 
@@ -9,6 +10,7 @@ import type {
   BillingMutationResponse,
   BillingRefusalCode,
   BillingStateResponse,
+  SubscriptionPreviewResponse,
   SubscriptionStateResponse
 } from './types'
 
@@ -48,8 +50,16 @@ export interface BillingApi {
   chargeStatus: (chargeId: string) => Promise<BillingResult<BillingChargeStatusResponse>>
   fetchBillingState: () => Promise<BillingResult<BillingStateResponse>>
   fetchSubscriptionState: () => Promise<BillingResult<SubscriptionStateResponse>>
+  /** Chargeless quote for a plan change (POST /subscription/preview). */
+  previewSubscriptionChange: (tierId: string) => Promise<BillingResult<SubscriptionPreviewResponse>>
+  /** Clear a scheduled downgrade / cancellation — the undo (DELETE pending-change). */
+  resumeSubscription: () => Promise<BillingResult<BillingMutationResponse>>
+  /** Schedule a chargeless downgrade at period end (PUT pending-change). */
+  scheduleSubscriptionChange: (tierId: string) => Promise<BillingResult<BillingMutationResponse>>
   stepUp: (sessionId?: string) => Promise<BillingResult<BillingMutationResponse>>
   updateAutoReload: (input: UpdateAutoReloadInput) => Promise<BillingResult<BillingMutationResponse>>
+  /** Window plans: "Keep going on credits" (billing.keep_going_on_credits). */
+  updateKeepGoingOnCredits: (enabled: boolean) => Promise<BillingResult<BillingMutationResponse>>
 }
 
 interface RefusalRecord {
@@ -137,7 +147,7 @@ const callBilling = async <T>(
 }
 
 export const createBillingApi = (requestGateway: BillingRequestGateway): BillingApi => ({
-  charge: async (amountUsd, idempotencyKey = crypto.randomUUID()) => {
+  charge: async (amountUsd, idempotencyKey = randomUuid()) => {
     const result = await callBilling<BillingChargeResponse>(requestGateway, 'billing.charge', {
       amount_usd: amountUsd,
       idempotency_key: idempotencyKey
@@ -149,6 +159,15 @@ export const createBillingApi = (requestGateway: BillingRequestGateway): Billing
     callBilling<BillingChargeStatusResponse>(requestGateway, 'billing.charge_status', { charge_id: chargeId }),
   fetchBillingState: () => callBilling<BillingStateResponse>(requestGateway, 'billing.state'),
   fetchSubscriptionState: () => callBilling<SubscriptionStateResponse>(requestGateway, 'subscription.state'),
+  previewSubscriptionChange: tierId =>
+    callBilling<SubscriptionPreviewResponse>(requestGateway, 'subscription.preview', {
+      subscription_type_id: tierId
+    }),
+  resumeSubscription: () => callBilling<BillingMutationResponse>(requestGateway, 'subscription.resume', {}),
+  scheduleSubscriptionChange: tierId =>
+    callBilling<BillingMutationResponse>(requestGateway, 'subscription.change', {
+      subscription_type_id: tierId
+    }),
   stepUp: sessionId =>
     callBilling<BillingMutationResponse>(requestGateway, 'billing.step_up', {
       ...(sessionId !== undefined ? { session_id: sessionId } : {})
@@ -158,11 +177,22 @@ export const createBillingApi = (requestGateway: BillingRequestGateway): Billing
       enabled: input.enabled,
       ...(input.threshold_usd !== undefined ? { threshold: input.threshold_usd } : {}),
       ...(input.reload_to_usd !== undefined ? { top_up_amount: input.reload_to_usd } : {})
-    })
+    }),
+  updateKeepGoingOnCredits: enabled =>
+    callBilling<BillingMutationResponse>(requestGateway, 'billing.keep_going_on_credits', { enabled })
 })
 
-export function useBillingApi(): BillingApi {
-  const { requestGateway } = useGatewayRequest()
+// An override for the gateway-backed api — DEV fixtures provide a simulated
+// implementation here so every consumer (hooks, rows) transparently runs against it
+// with no fixture awareness of their own. `null` (the default) = the real gateway api.
+const BillingApiContext = createContext<BillingApi | null>(null)
 
-  return useMemo(() => createBillingApi(requestGateway), [requestGateway])
+export const BillingApiProvider = BillingApiContext.Provider
+
+export function useBillingApi(): BillingApi {
+  const override = useContext(BillingApiContext)
+  const { requestGateway } = useGatewayRequest()
+  const real = useMemo(() => createBillingApi(requestGateway), [requestGateway])
+
+  return override ?? real
 }

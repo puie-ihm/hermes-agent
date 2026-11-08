@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useState } from 'react'
 
+import { PageLoader } from '@/components/page-loader'
 import { Button } from '@/components/ui/button'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import { getMemoryProviderConfig, saveMemoryProviderConfig } from '@/hermes'
 import { SlidersHorizontal } from '@/lib/icons'
+import { refreshMemoryStatus } from '@/store/memory-status'
 import { notifyError } from '@/store/notifications'
 import type { MemoryProviderConfig, MemoryProviderField } from '@/types/hermes'
 
-import { ListRow, LoadingState, Pill } from '../primitives'
+import { ListRow, Pill } from '../primitives'
 
 import { FieldControl, FieldTitle } from './field-control'
 import { ProviderConfigModal } from './provider-config-modal'
@@ -19,7 +21,7 @@ function seedValues(config: MemoryProviderConfig): Record<string, string> {
   )
 }
 
-export function ProviderConfigPanel({ provider }: { provider: string }) {
+export function ProviderConfigPanel({ profile, provider }: { profile?: string; provider: string }) {
   const [config, setConfig] = useState<MemoryProviderConfig | null>(null)
   const [loadError, setLoadError] = useState<null | string>(null)
   const [values, setValues] = useState<Record<string, string>>({})
@@ -29,7 +31,7 @@ export function ProviderConfigPanel({ provider }: { provider: string }) {
 
   const refresh = useCallback(async () => {
     try {
-      const next = await getMemoryProviderConfig(provider)
+      const next = await getMemoryProviderConfig(provider, profile)
       const seed = seedValues(next)
       setConfig(next)
       setValues(seed)
@@ -39,11 +41,16 @@ export function ProviderConfigPanel({ provider }: { provider: string }) {
       setConfig(null)
       setLoadError(err instanceof Error ? err.message : 'Memory provider settings failed to load')
     }
-  }, [provider])
+  }, [profile, provider])
 
   useEffect(() => {
     setConfig(null)
     void refresh()
+  }, [refresh])
+
+  const onModalSaved = useCallback(async () => {
+    refreshMemoryStatus()
+    await refresh()
   }, [refresh])
 
   // Autosave, matching the settings page around the panel: one-key partial PUT
@@ -55,7 +62,8 @@ export function ProviderConfigPanel({ provider }: { provider: string }) {
       }
 
       try {
-        await saveMemoryProviderConfig(provider, { [field.key]: value })
+        await saveMemoryProviderConfig(provider, { [field.key]: value }, profile)
+        refreshMemoryStatus()
 
         if (field.kind === 'secret') {
           setValues(current => ({ ...current, [field.key]: '' }))
@@ -73,7 +81,7 @@ export function ProviderConfigPanel({ provider }: { provider: string }) {
         notifyError(err, `Failed to save ${field.label}`)
       }
     },
-    [provider, saved]
+    [profile, provider, saved]
   )
 
   // Providers without a declared config surface (e.g. builtin) render nothing.
@@ -95,7 +103,7 @@ export function ProviderConfigPanel({ provider }: { provider: string }) {
       )
     }
 
-    return <LoadingState label="Loading memory provider settings..." />
+    return <PageLoader className="min-h-24" label="Loading memory provider settings..." />
   }
 
   const inlineFields = config.fields.filter(field => field.inline)
@@ -152,8 +160,9 @@ export function ProviderConfigPanel({ provider }: { provider: string }) {
         <ProviderConfigModal
           config={config}
           onOpenChange={setShowModal}
-          onSaved={refresh}
+          onSaved={onModalSaved}
           open={showModal}
+          profile={profile}
           provider={provider}
         />
       )}

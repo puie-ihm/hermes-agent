@@ -94,12 +94,14 @@ checkpoints:
   max_file_size_mb: 10        # 跳过大于此值的单个文件
 
   # 自动维护（默认开启）：启动时扫描 ~/.hermes/checkpoints/，
-  # 删除工作目录已不存在的项目条目（孤立项）或 last_touch 超过
-  # retention_days 的条目。通过 .last_prune 标记控制，
-  # 最多每 min_interval_hours 运行一次。
+  # 删除 last_touch 超过 retention_days 的条目。通过 .last_prune
+  # 标记控制，最多每 min_interval_hours 运行一次。此扫描不会删除
+  # “孤立”条目（工作目录未找到）——启动时工作目录缺失含义模糊
+  # （项目被删除，还是外部卷/网络共享/VPN 尚未挂载），因此孤立项
+  # 清理只能通过下方的 `hermes checkpoints prune` 命令显式触发，
+  # 并会要求确认。
   auto_prune: true
   retention_days: 7
-  delete_orphans: true
   min_interval_hours: 24
 ```
 
@@ -202,8 +204,8 @@ Hermes 在后台执行：
 ## 安全与性能保障
 
 - **Git 可用性** — 若 `PATH` 中找不到 `git`，检查点功能将透明地禁用。
-- **目录范围** — Hermes 跳过过于宽泛的目录（根目录 `/`、家目录 `$HOME`）。
-- **仓库大小** — 超过 50,000 个文件的目录将被跳过。
+- **目录范围** — Hermes 跳过过于宽泛的目录：根目录 `/`、家目录 `$HOME`，以及所有包含家目录的上级目录（如 `/home` 或 `/Users`）。即使项目就是 `~/.hermes` 本身，也绝不会把检查点存储快照进去。
+- **仓库大小** — 超过 50,000 个文件的目录将被跳过。被排除的目录（`node_modules/`、`.venv/`、`build/`、Hermes 自己的浏览器配置目录等）不计入数量，因此带有大型 `node_modules` 的小项目仍会被创建检查点。
 - **单文件大小上限** — 大于 `max_file_size_mb`（默认 10 MB）的文件不纳入快照，防止意外将数据集、模型权重或生成的媒体文件纳入存储。
 - **存储总大小上限** — 当存储超过 `max_total_size_mb`（默认 500 MB）时，按轮询方式丢弃每个项目最旧的提交，直到低于上限。
 - **真实剪枝** — `max_snapshots` 通过重写每项目引用并随后运行 `git gc --prune=now` 来强制执行，避免松散对象积累。

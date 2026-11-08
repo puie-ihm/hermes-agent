@@ -496,11 +496,16 @@ class _KanbanNotification:
     is at-least-once queueing, not an execution or final-response receipt.
     """
 
-    def __init__(self, runner: Any, d: dict, *, platform_cls: Any, sub_fail_counts: dict) -> None:
+    def __init__(self, runner: Any, d: dict, *, platform_cls: Any, sub_fail_counts: dict,
+                 notify_text: bool = True) -> None:
         self.runner = runner
         self.d = d
         self.platform_cls = platform_cls
         self.sub_fail_counts = sub_fail_counts
+        # ``kanban.notify_text``: when false, the visible ping text is suppressed while the
+        # cursor still advances and the wake leg still fires. Buyer-facing profiles use this
+        # so the raw internal notification never lands in a buyer DM.
+        self.notify_text = notify_text
         self.sub = sub = d["sub"]
         self.task = task = d["task"]
         self.board_slug = d.get("board")
@@ -713,6 +718,16 @@ class _KanbanNotification:
         for ev in self.d["events"]:
             msg = self.format_event(ev)
             if msg is None:
+                continue
+            # ``kanban.notify_text=false`` (external buyer-facing profiles): never post the
+            # visible ping. The event still advances the cursor and still feeds the wake leg
+            # below, so the creator is re-invoked to relay a clean, buyer-safe answer without
+            # the raw "✔ … Kanban … done" line leaking into the buyer DM.
+            if not self.notify_text:
+                logger.debug(
+                    "kanban notifier: notify_text=false; suppressing %s ping for %s on %s",
+                    ev.kind, self.task_id, self.platform_str,
+                )
                 continue
             # Non-push adapters (api_server) always report SendResult(success=False)
             # from send(); treating that as failure would drop the sub forever and

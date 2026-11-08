@@ -864,3 +864,81 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+def _patch_kanban_config(monkeypatch, **overrides):
+    """Override ``kanban.*`` keys for one notifier tick.
+
+    The watcher reads config once at boot through ``hermes_cli.config.load_config``,
+    so the stub wraps the real loader and only rewrites the kanban section.
+    """
+    from hermes_cli import config as config_mod
+
+    real_load_config = config_mod.load_config
+
+    def fake_load_config(*args, **kwargs):
+        cfg = real_load_config(*args, **kwargs)
+        cfg = dict(cfg) if isinstance(cfg, dict) else {}
+        cfg["kanban"] = {**(cfg.get("kanban") or {}), **overrides}
+        return cfg
+
+    monkeypatch.setattr(config_mod, "load_config", fake_load_config)
+
+
+def test_notify_text_false_suppresses_ping_but_still_wakes(tmp_path, monkeypatch):
+    """``kanban.notify_text=false`` silences the visible ping, not the wake.
+
+    Buyer-facing profiles rely on this: the raw internal notification
+    ("✔ … Kanban … done — <worker summary>") must never land in a buyer DM,
+    but the completion wake has to fire so the creator relays a clean answer.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "notify-text-off.db"))
+    kb.init_db()
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="buyer relay",
+            assignee="worker",
+            session_id="agent:main:telegram:dm:chat-1",
+        )
+        kbn.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            chat_type="dm",
+            delivery_mode="notify+wake",
+        )
+        kb.complete_task(conn, tid, summary="internal detail: 3 seats quoted")
+    finally:
+        conn.close()
+
+    _patch_kanban_config(monkeypatch, notify_text=False)
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    # The fixture renders the wake turn through adapter.handle_message, so a
+    # single handled event is the wake and `sent` staying empty is the gate.
+    assert adapter.sent == [], "notify_text=false must not post the raw notification text"
+    assert len(adapter.handled) == 1, "the completion wake must still fire"
+
+
+def test_notify_text_false_advances_the_cursor(tmp_path, monkeypatch):
+    """Suppressed pings must not be re-attempted on the next tick."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "notify-text-cursor.db"))
+    kb.init_db()
+    tid = _create_completed_subscription(summary="nothing to leak")
+
+    _patch_kanban_config(monkeypatch, notify_text=False)
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert _unseen_terminal_events(tid) == [], (
+        "the cursor must advance past a suppressed ping or every tick retries it"
+    )

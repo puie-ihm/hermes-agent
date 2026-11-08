@@ -79,6 +79,10 @@ class GatewayKanbanWatchersMixin:
         if not kanban_cfg.get("notify_in_gateway", True):
             logger.info("kanban notifier: disabled via config kanban.notify_in_gateway=false")
             return
+        # Visible ping text is config-gated: buyer-facing profiles set
+        # kanban.notify_text=false so the raw internal notification never lands
+        # in a buyer DM. The wake injection is independent of this flag.
+        notify_text = bool(kanban_cfg.get("notify_text", True))
 
         from gateway.config import Platform as _Platform
         try:
@@ -115,6 +119,7 @@ class GatewayKanbanWatchersMixin:
                 for d in deliveries:
                     await _KanbanNotification(
                         self, d, platform_cls=_Platform, sub_fail_counts=sub_fail_counts,
+                        notify_text=notify_text,
                     ).deliver()
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)

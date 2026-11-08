@@ -34,6 +34,37 @@ logger = logging.getLogger(__name__)
 # ``allowlist_suppresses_pairing``), so a plugin platform declares them like a bundled one.
 _GROUP_USER_ENV = {Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_USERS"}
 
+# DM-scoped allowlists (fork feature, ported onto the mixin): ``<PLATFORM>_DM_ALLOWED_USERS`` gates
+# 1:1 DM traffic ALONE — it overrides ``<PLATFORM>_ALLOW_ALL_USERS`` for DMs while leaving channel /
+# group traffic governed by the normal platform allowlist. Lets an operator run an open bot in
+# channels and keep DMs (incl. Slack Assistant) locked to a small admin list. ``*`` opens DMs.
+# Pairing-store approvals still bypass: they are explicit per-user grants.
+_PLATFORM_DM_USER_ENV = {
+    Platform.TELEGRAM: "TELEGRAM_DM_ALLOWED_USERS",
+    Platform.DISCORD: "DISCORD_DM_ALLOWED_USERS",
+    Platform.WHATSAPP: "WHATSAPP_DM_ALLOWED_USERS",
+    Platform.WHATSAPP_CLOUD: "WHATSAPP_CLOUD_DM_ALLOWED_USERS",
+    Platform.SLACK: "SLACK_DM_ALLOWED_USERS",
+    Platform.SIGNAL: "SIGNAL_DM_ALLOWED_USERS",
+    Platform.EMAIL: "EMAIL_DM_ALLOWED_USERS",
+    Platform.SMS: "SMS_DM_ALLOWED_USERS",
+    Platform.MATTERMOST: "MATTERMOST_DM_ALLOWED_USERS",
+    Platform.MATRIX: "MATRIX_DM_ALLOWED_USERS",
+    Platform.DINGTALK: "DINGTALK_DM_ALLOWED_USERS",
+    Platform.FEISHU: "FEISHU_DM_ALLOWED_USERS",
+    Platform.WECOM: "WECOM_DM_ALLOWED_USERS",
+    Platform.WECOM_CALLBACK: "WECOM_CALLBACK_DM_ALLOWED_USERS",
+    Platform.WEIXIN: "WEIXIN_DM_ALLOWED_USERS",
+    Platform.BLUEBUBBLES: "BLUEBUBBLES_DM_ALLOWED_USERS",
+    Platform.QQBOT: "QQ_DM_ALLOWED_USERS",
+    Platform.YUANBAO: "YUANBAO_DM_ALLOWED_USERS",
+}
+
+
+def _dm_allowlist_env(platform) -> str:
+    """The platform's DM-scoped allowlist env var name, or "" when it has none."""
+    return _PLATFORM_DM_USER_ENV.get(platform, "") if platform is not None else ""
+
 
 # Gate reads use the shared per-profile isolated reader (allowlist leak under multiplex, #72348).
 from gateway.platforms._shared import decode_json_list_literal as _decode_json_list_literal
@@ -768,6 +799,24 @@ class GatewayAuthorizationMixin:
         entry = _registry_entry(source.platform)
         platform_allow_env = authz_field(source.platform.value, "allowed_users_env", entry) or ""
         platform_allow_all_var = authz_field(source.platform.value, "allow_all_env", entry) or ""
+        # DM-scoped allowlist (fork feature): when ``<PLATFORM>_DM_ALLOWED_USERS`` is set it is the
+        # SOLE gate for 1:1 DM traffic, so it is consulted before the platform-wide ALLOW_ALL
+        # short-circuit — "open bot in channels, locked DMs" is the whole point. Channel/group
+        # traffic is untouched and falls through to the normal allowlist logic below. Pairing-store
+        # approvals bypass (explicit per-user grant), matching every other gate in this method.
+        if not is_group:
+            dm_env = _dm_allowlist_env(source.platform)
+            dm_raw = _auth_env(dm_env).strip() if dm_env else ""
+            if dm_raw:
+                dm_ids = _coerce_allow_set(dm_raw)
+                if _allows(dm_ids, user_id) or _principal_matches_allowlist(source, user_id, dm_ids):
+                    return True
+                pairing_store = self._pairing_store_for(source)
+                if pairing_store is not None and pairing_store.is_approved(
+                    source.platform.value if source.platform else "", user_id
+                ):
+                    return True
+                return False
         if platform_allow_all_var and _env_truthy(platform_allow_all_var):
             return True
         # Adapter-verified role auth (Discord DISCORD_ALLOWED_ROLES). ``is True``: no MagicMock pass.
@@ -841,6 +890,10 @@ class GatewayAuthorizationMixin:
             return config.unauthorized_dm_behavior
 
         allowlist_keys = ["GATEWAY_ALLOWED_USERS"]
+        # A DM-scoped allowlist (``<PLATFORM>_DM_ALLOWED_USERS``) is an explicit "lock the DMs"
+        # signal: answer unauthorized DMs silently instead of spamming pairing codes (#9337).
+        if platform and _auth_env(_dm_allowlist_env(platform)).strip():
+            return "ignore"
         if platform:
             dm_policy = self._adapter_policy(platform, "dm", profile)
             if not dm_policy:

@@ -83,6 +83,10 @@ class GatewayKanbanWatchersMixin:
         # kanban.notify_text=false so the raw internal notification never lands
         # in a buyer DM. The wake injection is independent of this flag.
         notify_text = bool(kanban_cfg.get("notify_text", True))
+        # Artifact uploads are gated too: the worker picks the local paths that leave
+        # the box, so a locked-down deployment must be able to close the path without
+        # losing the (redacted) text notification.
+        artifact_uploads = bool(kanban_cfg.get("notify_artifact_uploads", True))
 
         from gateway.config import Platform as _Platform
         try:
@@ -120,6 +124,7 @@ class GatewayKanbanWatchersMixin:
                     await _KanbanNotification(
                         self, d, platform_cls=_Platform, sub_fail_counts=sub_fail_counts,
                         notify_text=notify_text,
+                        artifact_uploads=artifact_uploads,
                     ).deliver()
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)

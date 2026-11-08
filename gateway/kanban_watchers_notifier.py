@@ -497,7 +497,7 @@ class _KanbanNotification:
     """
 
     def __init__(self, runner: Any, d: dict, *, platform_cls: Any, sub_fail_counts: dict,
-                 notify_text: bool = True) -> None:
+                 notify_text: bool = True, artifact_uploads: bool = True) -> None:
         self.runner = runner
         self.d = d
         self.platform_cls = platform_cls
@@ -506,6 +506,10 @@ class _KanbanNotification:
         # cursor still advances and the wake leg still fires. Buyer-facing profiles use this
         # so the raw internal notification never lands in a buyer DM.
         self.notify_text = notify_text
+        # ``kanban.notify_artifact_uploads``: when false the handoff's referenced local files
+        # are never uploaded. Defence against a prompt-injected worker exfiltrating on-disk
+        # files by naming them in the summary it hands back.
+        self.artifact_uploads = artifact_uploads
         self.sub = sub = d["sub"]
         self.task = task = d["task"]
         self.board_slug = d.get("board")
@@ -685,6 +689,13 @@ class _KanbanNotification:
         metadata: dict[str, Any] = dict(delivery_metadata) if isinstance(delivery_metadata, dict) else {}
         if sub.get("thread_id") and not metadata.get("thread_id"):
             metadata["thread_id"] = sub["thread_id"]
+        # Redact at the egress boundary: the ping embeds worker-authored text (handoff
+        # summary, block reason, and — on the gave_up branch — raw spawn-error output)
+        # which can carry secrets or PII. force=True so this holds regardless of the
+        # global security.redact_secrets preference: a chat post is an irreversible
+        # external send, so the egress side never trusts the local opt-out.
+        from agent.redact import redact_sensitive_text
+        msg = redact_sensitive_text(msg, force=True)
         _send_res = None
         async def send_ping():
             nonlocal _send_res
@@ -703,7 +714,10 @@ class _KanbanNotification:
         # review-bound card's files exist precisely so the human sees them at
         # handoff time. Retry exposure matches ``completed`` (the sub cursor is
         # rewound only when a send failed).
-        if ev.kind in ("completed", "review_requested"):
+        # ``kanban.notify_artifact_uploads=false`` closes this path entirely: the worker
+        # names the local paths inside its own handoff, so an un-gated upload lets a
+        # prompt-injected worker ship any file the gateway process can read.
+        if ev.kind in ("completed", "review_requested") and self.artifact_uploads:
             try:
                 await self.runner._deliver_kanban_artifacts(
                     adapter=adapter, chat_id=sub["chat_id"], metadata=metadata,

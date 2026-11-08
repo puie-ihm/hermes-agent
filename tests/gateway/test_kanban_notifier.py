@@ -942,3 +942,87 @@ def test_notify_text_false_advances_the_cursor(tmp_path, monkeypatch):
     assert _unseen_terminal_events(tid) == [], (
         "the cursor must advance past a suppressed ping or every tick retries it"
     )
+
+
+def _spy_artifact_delivery(monkeypatch):
+    """Record ``_deliver_kanban_artifacts`` calls instead of hitting an adapter."""
+    calls = []
+
+    async def fake_deliver(self, *, adapter, chat_id, metadata, event_payload, task):
+        calls.append({"chat_id": chat_id, "event_payload": event_payload})
+
+    monkeypatch.setattr(GatewayRunner, "_deliver_kanban_artifacts", fake_deliver)
+    return calls
+
+
+def _completed_with_artifacts(tmp_path, name, summary, artifact_path):
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="ship it", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.complete_task(
+            conn, tid, summary=summary, metadata={"artifacts": [str(artifact_path)]},
+        )
+        return tid
+    finally:
+        conn.close()
+
+
+def test_notifier_redacts_secrets_at_the_egress_boundary(tmp_path, monkeypatch):
+    """A worker-authored summary must never deliver a live credential to chat."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "redact-egress.db"))
+    kb.init_db()
+
+    secret = "sk-live-abc1234567890abcdefgh"
+    artifact = tmp_path / "report.txt"
+    artifact.write_text("x")
+    _completed_with_artifacts(
+        tmp_path, "redact", f"shipped; API_KEY={secret} used at build time", artifact,
+    )
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0]["text"]
+    assert secret not in text, "the notifier ping leaked a raw credential into the chat"
+    assert "***" in text, "expected the redaction marker where the credential was"
+
+
+def test_notify_artifact_uploads_false_skips_upload_but_keeps_text(
+    tmp_path, monkeypatch,
+):
+    """The upload gate closes file exfiltration without silencing the notification."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "no-artifacts.db"))
+    kb.init_db()
+
+    artifact = tmp_path / "deliverable.txt"
+    artifact.write_text("payload")
+    _completed_with_artifacts(tmp_path, "gate", f"done: {artifact}", artifact)
+
+    calls = _spy_artifact_delivery(monkeypatch)
+    _patch_kanban_config(monkeypatch, notify_artifact_uploads=False)
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert calls == [], "notify_artifact_uploads=false must not upload worker-named files"
+    assert len(adapter.sent) == 1, "the text notification still fires"
+
+
+def test_notify_artifact_uploads_defaults_on(tmp_path, monkeypatch):
+    """Default config keeps uploading handoff artifacts (no behaviour change)."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "default-artifacts.db"))
+    kb.init_db()
+
+    artifact = tmp_path / "deliverable.txt"
+    artifact.write_text("payload")
+    _completed_with_artifacts(tmp_path, "default", f"done: {artifact}", artifact)
+
+    calls = _spy_artifact_delivery(monkeypatch)
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(calls) == 1, "artifact delivery must stay enabled by default"
+    assert calls[0]["chat_id"] == "chat-1"

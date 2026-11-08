@@ -1955,6 +1955,12 @@ DEFAULT_CONFIG = {
         # error) never lands in the buyer DM. The completion WAKE still fires, so the creator
         # is re-invoked to relay a clean, buyer-safe answer. Cursor advance is unaffected.
         "notify_text": True,
+        # Whether the notifier uploads local files a worker referenced in its handoff
+        # (``kanban_complete(artifacts=[...])``) as native attachments. Set false on
+        # locked-down deployments so a prompt-injected worker cannot make the notifier
+        # exfiltrate on-disk files by naming them in the summary it hands back — the text
+        # notification (always redacted at the egress boundary) still fires.
+        "notify_artifact_uploads": True,
     },
     # Bot Mode cross-connection relay (tools/bot_relay.py): envelopes queued by message_agent for
     # agents on other connections wait in an on-disk outbox until the Desktop drains them.

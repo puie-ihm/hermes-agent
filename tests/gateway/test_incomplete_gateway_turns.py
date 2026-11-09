@@ -1,6 +1,7 @@
 """Regression tests for hidden-reasoning-only incomplete gateway turns."""
 
 import asyncio
+import json
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -99,6 +100,10 @@ def _make_runner(adapter: CaptureSlackAdapter) -> gateway_run.GatewayRunner:
     # (#47237). A bare MagicMock returns a truthy mock, which would wrongly
     # mark the user turn as a duplicate and skip persisting it.
     runner.session_store.has_platform_message_id = MagicMock(return_value=False)
+    # Same hazard for the persisted /model override: the rehydrate path treats
+    # any truthy return as a real override and then resolves a provider from the
+    # mock. A real store returns a dict or None (#47315).
+    runner.session_store.get_model_override = MagicMock(return_value=None)
     runner.session_store.transcript_tail_role = MagicMock(return_value="user")
     runner._running_agents = {}
     runner._pending_messages = {}
@@ -151,7 +156,20 @@ async def test_incomplete_codex_turn_closes_transcript_without_slack_delivery(mo
         for call in runner.session_store.append_to_transcript.call_args_list
     ]
     assert transcript_roles == ["session_meta", "user", "assistant"]
-    assert runner.session_store.append_to_transcript.call_args_list[1].args[1]["content"] == "hello"
+    # A Slack channel is a shared multi-user session, so the gateway stamps the user
+    # turn with its verified actor envelope (_prefix_inbound_sender_context). Parse the
+    # envelope instead of pinning the JSON blob, then assert the operator's text
+    # survived intact.
+    persisted_user = runner.session_store.append_to_transcript.call_args_list[1].args[1]["content"]
+    prefix, separator, body = persisted_user.partition("] ")
+    assert separator == "] ", f"no actor envelope in {persisted_user!r}"
+    assert prefix.startswith("[Gateway actor ")
+    assert json.loads(prefix[len("[Gateway actor "):]) == {
+        "platform": "slack",
+        "user_id": "U123",
+        "slack_mention": "<@U123>",
+    }
+    assert body == "hello"
     boundary = runner.session_store.append_to_transcript.call_args_list[2].args[1]["content"]
     assert boundary == FAILED_TURN_NOTICE
     assert adapter.processing_hooks == [

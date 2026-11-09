@@ -208,12 +208,20 @@ The 36 fork commits are a **feature fork**, not a patch queue: many are labelled
 
 ## Verification checklist
 
-- [ ] `python -m pytest tests/ -o 'addopts=' -q` green (or documented pre-existing fails)
-- [x] sentinel/dedup/triage tests green
-- [x] kanban governance tests green
-- [x] holographic fact store loads, `fact_store` reachable (isolated home; the
-  live-home install is cutover step 0)
-- [x] holographic scaffolding guard: 6 fixtures PASS patched (v0.26.5 and v0.26.4)
-  / 4 FAIL unpatched, 20 unit tests green
-- [ ] opencode-go request path works (one live model call)
-- [ ] gateway restart + Slack DM round-trip
+Full evidence table: **`CUTOVER-READINESS.md`** (re-executed 2026-11-09 @ `3eb6f714dd`).
+
+| Check | Verdict | Evidence |
+|---|---|---|
+| `python -m pytest tests/ -o 'addopts=' -q` | NOT GREEN | collection aborts: `truststore`, `keyring` (x2), `mcp==2.3.0` (venv has 1.26.0, fails the same at baseline). The 3 unblocked via a `--target` shim: 29 passed |
+| sentinel/dedup/triage tests | GREEN | 143 passed, 9 suites |
+| kanban governance tests | NOT GREEN (fixture) | 141 passed, 2 failed on upstream's new spawn requirement (`no current run id`); env-injection behaviour retained in `kanban_db_dispatch.py:2902` |
+| holographic fact store loads, `fact_store` reachable | GREEN (throwaway home) | post-migration (`_config_version 52`) home: provider available, `find_provider_dir` → catalog install, 177 facts (53+13+11+100) |
+| holographic scaffolding guard | GREEN | `1b74b02215` + `59174eb9c6`; 20 unit tests pass (re-run 2026-11-09); 6 fixtures PASS patched / 4 FAIL unpatched per the commit |
+| opencode-go request path (one live call) | BLOCKED | model resolution OK (`deepseek-v4.1-flash -> 1000000 tokens detected`); headless turn blocked by the TUI gateway's self-provisioned runtime env missing `pydantic`. Re-run against the live home post-merge |
+| gateway restart + Slack DM round-trip | NOT TESTED | requires the live restart — post-approval only |
+
+Three branch-local items must close before cutover: the `test_slack_thread_context_allowlist.py`
+regression introduced by `cad0aaaf0d`, the two stale kanban spawn fixtures, and the sender-prefix
+assertion. `tests/gateway/test_slack_stale_guard.py` is DROPPED-OBSOLETE (fork guard was opt-in and
+unset; v0.23.0 has no wall-clock ingress drop) — delete it.
+

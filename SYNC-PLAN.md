@@ -103,7 +103,8 @@ The 36 fork commits are a **feature fork**, not a patch queue: many are labelled
    ```
    python scripts/holographic_scaffolding_guard.py apply --home <each profile home>
    python scripts/holographic_scaffolding_guard.py check --home <each profile home>   # exit 1 = wiped
-   python scripts/holographic_scaffolding_guard.py diff  --plugin-dir <clone>         # the upstream patch
+   python scripts/holographic_scaffolding_guard.py diff  --plugin-dir <clone>         # the patch we re-apply
+   python scripts/holographic_scaffolding_guard.py diff --pr --plugin-dir <clone>      # the same, sentinel-free
    python scripts/holographic_scaffolding_guard.py restore --home <each home>         # undo, before an update
    python scripts/verify_holographic_scaffolding_guard.py --home <one home>           # 6 fixtures, ALL PASS
    ```
@@ -117,7 +118,7 @@ The 36 fork commits are a **feature fork**, not a patch queue: many are labelled
    this tree's `plugin-catalog/holographic.yaml`, i.e. what a plain
    `hermes plugins install holographic` resolves to at cutover). Verified on a
    clean clone of each: `apply` → `check` OK, and the patched v0.26.4 tree passes
-   the same six fixtures. 19 unit tests green (`tests/scripts/`).
+   the same six fixtures. 20 unit tests green (`tests/scripts/`).
    Verified against the catalog pin v0.26.5 / `f75c636a28` on a copy of the live
    store: scaffolded and `[thread parent]` inputs add **0** facts, a genuine
    `I always want the CSV as a code block` adds **1**, and `[Puie]` /
@@ -140,8 +141,9 @@ The 36 fork commits are a **feature fork**, not a patch queue: many are labelled
    2026-11-09), so a contribution needs a fork plus a public PR — an
    outward-facing action that needs an operator to approve it. The card that
    owns this (t_4cea71f2) carries the ready branch name, commit message and PR
-   body in its comments; `diff` prints the exact two hunks and they apply to a
-   clean clone of both supported versions with `git apply --check`.
+   body in its comments; `diff --pr` prints the exact two hunks without our sentinel lines, and
+   they apply to a clean clone of both supported versions with `git apply --check` and pass the
+   same six fixtures (verified on v0.26.5).
    The update order is **restore → `hermes plugins update` → apply**. Not optional: the plugin
    install is a git checkout, and the two patched files are tracked, so the plugin's own
    `git pull` refuses a modified tree ("local changes would be overwritten by merge") and its
@@ -212,6 +214,6 @@ The 36 fork commits are a **feature fork**, not a patch queue: many are labelled
 - [x] holographic fact store loads, `fact_store` reachable (isolated home; the
   live-home install is cutover step 0)
 - [x] holographic scaffolding guard: 6 fixtures PASS patched (v0.26.5 and v0.26.4)
-  / 4 FAIL unpatched, 19 unit tests green
+  / 4 FAIL unpatched, 20 unit tests green
 - [ ] opencode-go request path works (one live model call)
 - [ ] gateway restart + Slack DM round-trip

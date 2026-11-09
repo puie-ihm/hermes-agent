@@ -26,6 +26,9 @@ USAGE
     # dry run: show what would change
     python scripts/holographic_scaffolding_guard.py diff --plugin-dir ~/.hermes/plugins/holographic
 
+    # the patch as it should be contributed upstream (sentinels removed, applies to a clean clone)
+    python scripts/holographic_scaffolding_guard.py diff --pr --plugin-dir <clean clone>
+
     # apply to the installed plugin of one or more profile homes (idempotent)
     python scripts/holographic_scaffolding_guard.py apply --home ~/.hermes --home ~/.hermes/profiles/tech_agent
 
@@ -210,12 +213,21 @@ def unpatched_text(text: str, anchors: list[tuple[str, str]]) -> tuple[str, str]
     return out, "restored"
 
 
+def _drop_sentinels(text: str) -> str:
+    """The patch as it should be contributed: the same code without our bookkeeping markers.
+
+    The ``# IHM-GUARD: …`` lines only tell this patcher a file is already patched; upstream has no
+    use for them, and a PR carrying them would invite the question of who IHM is.
+    """
+    return re.sub(r"^[ \t]*#\s*IHM-GUARD: holographic-scaffolding-guard v\d+\n", "", text, flags=re.MULTILINE)
+
+
 def report_diff(name: str, old: str, new: str) -> None:
     sys.stdout.writelines(difflib.unified_diff(old.splitlines(keepends=True), new.splitlines(keepends=True),
                                                fromfile=f"a/{name}", tofile=f"b/{name}"))
 
 
-def process(root: Path, mode: str) -> int:
+def process(root: Path, mode: str, pr: bool = False) -> int:
     if not root.is_dir():
         print(f"FAIL  {root}: no such plugin directory")
         return 2
@@ -246,7 +258,7 @@ def process(root: Path, mode: str) -> int:
             changed.append((path, old, new))
     if mode == "diff":
         for path, old, new in changed:
-            report_diff(path.name, old, new)
+            report_diff(path.name, old, _drop_sentinels(new) if pr else new)
         if not changed:
             print(f"ALREADY {root}: {GUARD_ID}")
         return 0
@@ -272,13 +284,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("mode", choices=("apply", "check", "diff", "restore"))
     ap.add_argument("--home", action="append", default=[], help="HERMES_HOME of a profile; plugin at <home>/plugins/holographic")
     ap.add_argument("--plugin-dir", action="append", default=[], help="plugin directory directly (a clone or a scratch copy)")
+    ap.add_argument("--pr", action="store_true",
+                    help="diff: omit the IHM-GUARD sentinel lines, i.e. the patch to contribute upstream")
     args = ap.parse_args(argv)
     targets = plugin_dirs(args)
     if not targets:
         ap.error("give at least one --home or --plugin-dir")
     worst = 0
     for root in targets:
-        worst = max(worst, process(root, args.mode))
+        worst = max(worst, process(root, args.mode, args.pr))
     return worst
 
 

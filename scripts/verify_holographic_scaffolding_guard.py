@@ -47,6 +47,13 @@ FIXTURES = {
 }
 DEFAULT_STORE = "~/.hermes/memory_store.db"
 
+# The plugin imports core modules by bare name (`utils`, `hermes_state_wal`), and `python
+# scripts/verify_...py` puts scripts/ - not the repo root - on sys.path. Without this the run dies with
+# ModuleNotFoundError before the first fixture, so put the repo root on the path up front.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 
 def copy_store(source: Path, target: Path) -> None:
     src = sqlite3.connect(f"file:{source}?mode=ro", uri=True)

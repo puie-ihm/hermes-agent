@@ -83,6 +83,15 @@ def test_diff_writes_nothing(tmp_path, capsys):
     assert (plugin / "screen.py").read_text(encoding="utf-8") == before
 
 
+def test_pr_diff_omits_our_sentinels(tmp_path, capsys):
+    """The patch we would contribute: same code, none of the markers only this patcher cares about."""
+    plugin = build_plugin(tmp_path)
+    assert guard.main(["diff", "--pr", "--plugin-dir", str(plugin)]) == 0
+    out = capsys.readouterr().out
+    assert "IHM-GUARD" not in out
+    assert "+def scaffolding_in" in out and "+            content = strip_leading_author_prefix(content)" in out
+
+
 def test_unknown_version_warns_but_still_matches_on_anchors(tmp_path, capsys):
     plugin = build_plugin(tmp_path)
     (plugin / "plugin.yaml").write_text('name: holographic\nversion: "9.9.9"\n', encoding="utf-8")

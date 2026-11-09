@@ -42,7 +42,16 @@ error at import, so pytest aborts (`Interrupted: 4 errors during collection`, 19
 The three truststore/keyring modules were unblocked **without touching the live venv**
 (`pip install --target /tmp/sync-verify/deps keyring` + `--no-deps truststore`, `PYTHONPATH`
 shim, `cryptography` deliberately removed from the shim so the venv's 46.0.7 stays
-authoritative): **29 passed in 22.3s**. `pip install -e .` at cutover installs all four.
+authoritative): **29 passed in 22.3s**.
+
+The canonical runner was also tried, `scripts/run_tests.sh -j 4`: it correctly rebuilt the checkout's
+locked test environment (python 3.14, deps hash-verified against `uv.lock`) and then exited 1 with
+`no bootstrap Python found; run setup-hermes.sh` — a bare-worktree harness limitation, **not** a test
+result. It does settle the attribution: `uv.lock` pins exactly what this venv lacks —
+`mcp 2.3.0`, `truststore 0.10.5`, `keyring 25.7.0` — so `pip install -e .` (or a `pm` sync) at cutover
+closes all four collection errors.
+
+**Consequence: the full-suite verdict stays open.** `pip install -e .` at cutover installs all four.
 
 ## 8. Config migration — what it silently changes
 

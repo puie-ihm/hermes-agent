@@ -5,7 +5,13 @@ gateway authz chain only treats ``group``/``forum``/``channel`` as group chats, 
 thread's senders were judged on the DM allowlist (``allow_from``) and ``group_allow_from`` was
 never read: ``group_allow_from: ["*"]`` tagged every human, and a DM-only ``allow_from`` user
 read as verified inside a channel. The live inbound message is authorized as ``group`` (channel)
-or ``dm`` (IM/MPIM), so thread-context senders now get that same chat type and ``thread_id``.
+or ``dm`` (a genuine 1:1 IM), so thread-context senders now get that same chat type and
+``thread_id``.
+
+Fork semantics on ``chat_type``: an MPIM (group DM, ``G…`` id) is a shared multi-party surface.
+``_session_chat_type`` keys it as ``group`` and admission follows ``group_allow_from`` /
+``SLACK_ALLOWED_USERS`` — never the DM allowlist. That is what live does, and the tests here pin
+it (see ``tests/gateway/test_slack_mpim_admission_fork.py`` for the full admission matrix).
 
 Composed: a real ``SlackAdapter`` (fake ``conversations.replies``), a real
 ``GatewayRunner._make_adapter_auth_check`` callback and a real ``config.yaml`` read through
@@ -200,10 +206,14 @@ async def test_mention_in_channel_thread_end_to_end():
 
 
 @pytest.mark.asyncio
-async def test_mpim_thread_uses_the_dm_allowlist_end_to_end():
-    """A group DM (MPIM, ``G…`` id) is admitted as ``dm``; its thread senders must be judged on
-    the same list even though the id does not start with ``D`` (green on main too)."""
-    adapter = _wired_adapter("  allow_from: [U_INSIDER]\n  group_allow_from: ['*']\n")
+async def test_mpim_thread_uses_the_group_allowlist_end_to_end():
+    """A group DM (MPIM, ``G…`` id) is a shared surface: it is admitted as ``group`` and its
+    thread senders are judged on ``group_allow_from``, not the DM ``allow_from`` list.
+
+    ``allow_from: ["*"]`` makes the discrimination sharp — if the sender check used the DM list
+    nobody would be tagged; the fork's group verdict must still tag ``U_OUTSIDER``.
+    """
+    adapter = _wired_adapter("  allow_from: ['*']\n  group_allow_from: [U_INSIDER]\n")
 
     await adapter._handle_slack_message({
         "type": "message", "channel": "G1", "channel_type": "mpim", "user": "U_INSIDER",
@@ -211,19 +221,23 @@ async def test_mpim_thread_uses_the_dm_allowlist_end_to_end():
     })
 
     msg_event = adapter.handle_message.call_args[0][0]
-    assert msg_event.source.chat_type == "dm"
+    assert msg_event.source.chat_type == "group"
     assert _tagged(msg_event.channel_context) == {"U_OUTSIDER"}
 
 
 @pytest.mark.asyncio
 async def test_wake_probe_caches_context_with_the_inbound_chat_type():
     """The un-mentioned wake check fills the thread cache before hydration reads it; an MPIM
-    (``G…`` id, inbound ``dm``) must be cached with ``dm`` verdicts (green on main too)."""
-    adapter = _wired_adapter("  allow_from: [U_INSIDER]\n  group_allow_from: ['*']\n")
+    (``G…`` id, inbound ``group``) must be cached with ``group`` verdicts.
+
+    The YAML makes the group list the strict one and the DM list permissive, so a cache filled
+    with ``dm`` verdicts would come back untagged and fail the assertion.
+    """
+    adapter = _wired_adapter("  allow_from: ['*']\n  group_allow_from: [U_INSIDER]\n")
 
     await adapter._should_wake_on_unmentioned_message(
         event_thread_ts="100.0", channel_id="G1", user_id="U_INSIDER", is_thread_reply=True,
-        chat_type="dm")
+        chat_type="group")
     content = await _context(adapter, channel_id="G1")
 
     assert adapter._app.client.conversations_replies.await_count == 1  # served from the cache

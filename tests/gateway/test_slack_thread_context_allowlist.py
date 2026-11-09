@@ -64,7 +64,7 @@ THREAD = [
 @pytest.fixture(autouse=True)
 def _clean_auth_env(monkeypatch):
     for var in (
-        "SLACK_ALLOWED_USERS", "SLACK_ALLOW_ALL_USERS", "SLACK_ALLOW_BOTS",
+        "SLACK_ALLOWED_USERS", "SLACK_DM_ALLOWED_USERS", "SLACK_ALLOW_ALL_USERS", "SLACK_ALLOW_BOTS",
         "GATEWAY_ALLOWED_USERS", "GATEWAY_ALLOW_ALL_USERS",
     ):
         monkeypatch.delenv(var, raising=False)

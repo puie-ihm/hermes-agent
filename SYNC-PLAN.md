@@ -47,7 +47,7 @@ a clean cutover would silently drop them.
 | minimax-oauth auxiliary branch | present upstream (38 hits) — likely obsolete | agent/auxiliary_client.py |
 | Per-platform DM allowlist | 0 hits (`PLATFORM_DM_ALLOWED_USERS` absent in both) | gateway/ |
 | Holographic memory in core | removed upstream → catalog plugin | plugins/memory/ |
-| Holographic scaffolding rejection (`_is_storable_memory_text` / `_strip_leading_author_prefix`, fork cherry-picks `d4797d7115` + `2fa5763d10`) | absent from catalog plugin v0.26.5 | was `plugins/memory/holographic/__init__.py` |
+| Holographic scaffolding rejection (`_is_storable_memory_text` / `_strip_leading_author_prefix`, fork cherry-picks `d4797d7115` + `2fa5763d10`) | absent from catalog plugin v0.26.5 → carried as our own re-applied patch (`scripts/holographic_scaffolding_guard.py`), upstream PR pending | was `plugins/memory/holographic/__init__.py`, now the catalog plugin's `screen.py` + `__init__.py` |
 
 The 36 fork commits are a **feature fork**, not a patch queue: many are labelled
 "cherry-pick from <sha>" where that sha never landed on upstream main
@@ -93,14 +93,67 @@ The 36 fork commits are a **feature fork**, not a patch queue: many are labelled
    branch: a bundled dir wins over the user-installed plugin
    (`plugins/memory/__init__.py` precedence) and a partial copy shadows the
    catalog install while failing to import its `store` submodule.
-   **Open gap (verified):** the catalog plugin does not carry the fork's
-   `_is_storable_memory_text` / `_strip_leading_author_prefix` guards —
-   `_auto_extract_facts` stores Slack scaffolding verbatim (feeding it the
+   **Resolved locally, upstream pending (t_4cea71f2):** the catalog plugin does not
+   carry the fork's `_is_storable_memory_text` / `_strip_leading_author_prefix`
+   guards, so `_auto_extract_facts` stored Slack scaffolding verbatim (the
    SCAFFOLDED fixture added a fact containing `[Replying to: …]` /
-   `[Thread context …]`; the live store already holds several such rows). The
-   fork's `tests/plugins/memory/test_holographic_auto_extract.py` was deleted
+   `[Thread context …]`; the live store holds 64 such rows). The guard now ships
+   as a patch we own and re-apply:
+
+   ```
+   python scripts/holographic_scaffolding_guard.py apply --home <each profile home>
+   python scripts/holographic_scaffolding_guard.py check --home <each profile home>   # exit 1 = wiped
+   python scripts/holographic_scaffolding_guard.py diff  --plugin-dir <clone>         # the upstream patch
+   python scripts/holographic_scaffolding_guard.py restore --home <each home>         # undo, before an update
+   python scripts/verify_holographic_scaffolding_guard.py --home <one home>           # 6 fixtures, ALL PASS
+   ```
+
+   The patch adds `SCAFFOLDING_MARKERS` / `strip_leading_author_prefix` /
+   `scaffolding_in` to the plugin's `screen.py` and applies them at the top of
+   `_auto_extract_facts` (before the sentence loop: the thread-context block
+   spans sentences, so a per-sentence screen would keep the person's own part).
+   Anchors are byte-exact against **both** catalog versions we can install:
+   v0.26.5 (`f75c636a28`, the live pin) and v0.26.4 (`6fe7d424cd`, the pin in
+   this tree's `plugin-catalog/holographic.yaml`, i.e. what a plain
+   `hermes plugins install holographic` resolves to at cutover). Verified on a
+   clean clone of each: `apply` → `check` OK, and the patched v0.26.4 tree passes
+   the same six fixtures. 19 unit tests green (`tests/scripts/`).
+   Verified against the catalog pin v0.26.5 / `f75c636a28` on a copy of the live
+   store: scaffolded and `[thread parent]` inputs add **0** facts, a genuine
+   `I always want the CSV as a code block` adds **1**, and `[Puie]` /
+   `[New message]` labels are **stripped** rather than stored. Without the patch
+   the same run adds 4 scaffolding facts (4 FAIL / 2 PASS baseline), so the check
+   is not vacuous. The live store's sha256 is identical before and after the run.
+
+   The patch is **guard v2**. v1 (the first draft, never installed anywhere) called `.strip()` on
+   `content` without checking it was a str: a multimodal message's `content` is a block list, so
+   auto-extraction raised `AttributeError: 'list' object has no attribute 'strip'` — reproduced on
+   the v1-patched clone. v2 hands a non-str back to the provider's own `isinstance` check, and the
+   verifier's sixth fixture (`multimodal`) covers it. A file that carries an *older* version of the
+   guard is now refused with exit 2 and a "reinstall the plugin" message instead of being reported
+   as already patched, which is what would otherwise hide a stale guard after a guard bump.
+
+   **Why a local patch and not the upstream PR yet:** the correct home is
+   `itpartypattaya/hermes-plugin-holographic` (a local patch is overwritten by
+   `hermes plugins update`), but the `puie-ihm` token has **read** only on that
+   repo (`gh repo view ... --json viewerPermission` → `READ`, re-checked
+   2026-11-09), so a contribution needs a fork plus a public PR — an
+   outward-facing action that needs an operator to approve it. The card that
+   owns this (t_4cea71f2) carries the ready branch name, commit message and PR
+   body in its comments; `diff` prints the exact two hunks and they apply to a
+   clean clone of both supported versions with `git apply --check`.
+   The update order is **restore → `hermes plugins update` → apply**. Not optional: the plugin
+   install is a git checkout, and the two patched files are tracked, so the plugin's own
+   `git pull` refuses a modified tree ("local changes would be overwritten by merge") and its
+   staging step copies local changes forward. `restore` puts both files back byte-for-byte
+   (verified: the restored tree is identical to the catalog clone and `git status --porcelain`
+   is empty), which is what makes the update clean. Then `apply` again, and `check` exits 1 if
+   anything is missing. `plugins.auto_apply` is `False` by default and unset in all nine
+   profile homes, so nothing wipes the guard in the background today — a human
+   `hermes plugins update` is the realistic trigger.
+   The fork's `tests/plugins/memory/test_holographic_auto_extract.py` was deleted
    here — the module it imports left core, so it could only error at
-   collection; upstream v0.23.0 does not carry it either.
+   collection; its cases live on in `tests/scripts/test_holographic_scaffolding_guard.py`.
 7. **Config migration**: `hermes config migrate`, diff the resulting config for
    silent key drops; verify cron jobs (RPL 09:00 BKK, Acceptance, WBRR) still load.
 
@@ -126,6 +179,23 @@ The 36 fork commits are a **feature fork**, not a patch queue: many are labelled
    Verify after each: `hermes -p <profile> memory status` shows the provider
    loaded and the fact count.
 
+   **Then apply the scaffolding guard to every home** — the catalog plugin does
+   not carry the fork's guard (step 6), and without it `auto_extract: true`
+   stores thread context and reply quotes as facts:
+
+   ```
+   python scripts/holographic_scaffolding_guard.py apply \
+       --home ~/.hermes $(for p in tech_agent buyer_ops data_analyst ext_data_analyst \
+            affiliate_mgr media_buyer legal_reviewer front_external; do \
+            echo --home ~/.hermes/profiles/$p; done)
+   python scripts/verify_holographic_scaffolding_guard.py --home ~/.hermes   # ALL PASS
+   ```
+
+   For every later `hermes plugins update`: `restore` first (the patched files are tracked, so the
+   plugin's own git pull refuses a modified tree), update, then `apply` again and `check` — it
+   exits 1 when the guard is missing, so a `check` in the weekly ops sweep is the cheap detector.
+   `apply` takes every `--home` in one run, so the three commands loop over all nine homes.
+
 1. Freeze: confirm no long agent run in flight.
 2. `git checkout main && git merge --ff-only sync/v0.23.0` in the live tree.
 3. Update deps in the live venv (`pip install -e .`), run `hermes config migrate`.
@@ -141,5 +211,7 @@ The 36 fork commits are a **feature fork**, not a patch queue: many are labelled
 - [x] kanban governance tests green
 - [x] holographic fact store loads, `fact_store` reachable (isolated home; the
   live-home install is cutover step 0)
+- [x] holographic scaffolding guard: 6 fixtures PASS patched (v0.26.5 and v0.26.4)
+  / 4 FAIL unpatched, 19 unit tests green
 - [ ] opencode-go request path works (one live model call)
 - [ ] gateway restart + Slack DM round-trip

@@ -454,6 +454,61 @@ saved; `all` alone is not a Kanban opt-in.
 Dispatcher-owned workers receive their task lifecycle tools automatically.
 `delegate_task` children do not gain permission to mutate the board.
 
+## Bounding what a chat profile can do
+
+Enabling the `kanban` toolset hands a chat profile the whole board. Two keys in that
+profile's `config.yaml` narrow it down without withholding board access, and both are
+keyed on profile name. Their defaults — `{}` and `[]` — mean "no restriction", so an
+existing config behaves exactly as before.
+
+### `kanban.assignee_allowlist` — who a creator may route work to
+
+Maps a creator profile to the assignees it may create or dispatch work for. A creator
+absent from the map is unrestricted.
+
+```yaml
+kanban:
+  assignee_allowlist:
+    front_external: [ext_data_analyst]
+```
+
+The pairing is enforced twice, both against the trusted process identity rather than a
+caller-supplied field. `kanban_create` rejects the call outright, and the dispatcher
+re-checks the stored `created_by` → `assignee` pair before claiming — so a row edited
+out-of-band, or one backfilled from `kanban.default_assignee`, is refused as well. A
+blocked ready-lane card is moved to `blocked` with a `policy_violation` event as the
+audit trail; a review-lane card is recorded and skipped instead (`block_task` does not
+transition out of `review`), and a pinned-out review row does not withhold the ready
+lane's reservation. Both layers exist for the same reason: a prompt-injected creator
+must not be able to route work to an off-limits worker.
+
+### `kanban.restrict_to_own_tasks` — per-profile task visibility
+
+Lists profiles that may only see and mutate tasks they created. Intended for buyer- or
+customer-facing chat profiles that share a board with internal orchestration.
+
+```yaml
+kanban:
+  restrict_to_own_tasks: [buyer_support]
+```
+
+For a listed profile:
+
+- `kanban_list` is filtered server-side to its own rows, before the `LIMIT` — not
+  filtered client-side after truncation.
+- A foreign task id is worded exactly like a genuine miss (`task <id> not found`), so the
+  caller cannot enumerate ids by probing for a distinct "forbidden" answer. This covers
+  show, complete, block, schedule, request-review, request-changes, heartbeat, comment,
+  attach, attach-url, the attachment listing, unblock, and both endpoints of link.
+- `kanban_create` rejects foreign parent ids and pins the new task to a scratch
+  workspace, so a restricted creator can neither attach work under a task it cannot see
+  nor point a child at an arbitrary on-disk path.
+
+Dispatcher-spawned workers (`HERMES_KANBAN_TASK` set) are never restricted by this list —
+their own task-ownership scoping already applies. `HERMES_KANBAN_RESTRICT_TO_OWN=1` is the
+env-flag equivalent, applying the same scoping to whichever profile the process runs as,
+for deployments that cannot edit `config.yaml`.
+
 ## How workers interact with the board
 
 **Workers do not shell out to `hermes kanban`.** When the dispatcher spawns a worker it sets `HERMES_KANBAN_TASK=t_abcd` in the child's env, and that env var flips on a dedicated **kanban toolset** in the model's schema. The same toolset is also available to orchestrator profiles that enable `kanban` in their toolsets config. These tools read and mutate the board directly via the Python `kanban_db` layer, same as the CLI does. A running worker calls these like any other tool; it never sees or needs the `hermes kanban` CLI.
@@ -1293,6 +1348,28 @@ A "wake" forges a synthetic inbound message to the destination gateway agent so 
 **Which events wake.** The ones that return a task outcome or require orchestration attention: `completed`, `blocked`, `gave_up`, `crashed`, `timed_out`, `review_requested` (a worker finished the implementation and handed off via `kanban_request_review`) and `block_loop_detected` (the task was routed to `triage` after repeated blocks). `status`, `archived` and `unblocked` are delivered but never wake — they are bookkeeping transitions, not attention signals. When a `completed` or `review_requested` event carries a summary, that handoff rides the wake turn, so the woken agent sees what the worker actually did.
 
 `--chat-type` (`dm` | `group` | `channel` | `thread`) records the originating chat's type so a woken turn resolves the operator's **real** session: `build_session_key` keys groups, channels, and threads differently from DMs, so an inaccurate `chat_type` would route the wake into a separate, context-less session. The `/kanban` auto-subscribe and slash-command paths capture this automatically — you only set it by hand when subscribing a chat from a script or cron. Omit it to leave an existing subscription unchanged (new subscriptions default to `dm`).
+
+### Per-profile notification gates
+
+Two keys in the `kanban` section of the **delivering** profile's `config.yaml` narrow what
+the notifier actually emits. Both default to `true`, so an unmodified config behaves as
+described above.
+
+| Config key | Default | What it does |
+|------------|---------|--------------|
+| `kanban.notify_text` | `true` | Whether the visible ping is posted at all. `false` suppresses the `✔ [board] @assignee Kanban <id> done — …` message for every terminal event, while the delivery cursor still advances and the wake leg still fires — so a `notify+wake` subscription still re-invokes the creator, which relays a clean answer, and the raw internal ping (worker summary, block reason, spawn error) never lands in the chat. Set it on external buyer-facing profiles. |
+| `kanban.notify_artifact_uploads` | `true` | Whether the notifier uploads the local files a worker named in its `kanban_complete(artifacts=[…])` or `kanban_request_review` handoff as native attachments. `false` closes that path entirely: the worker picks the paths, so an un-gated upload lets a prompt-injected worker ship any file the gateway process can read. The text notification is unaffected. |
+
+```yaml
+kanban:
+  notify_text: false                 # buyer-facing profile: wake only, no raw ping
+  notify_artifact_uploads: false     # never ship worker-named local files
+```
+
+Ping text is redacted at the egress boundary regardless of `security.redact_secrets`: a
+chat post is irreversible, so the notifier force-redacts the worker-authored text it embeds
+(handoff summary, block reason, raw spawn-error output) instead of honouring the local
+opt-out.
 
 ### Multi-profile setups: delivery is profile-owned
 

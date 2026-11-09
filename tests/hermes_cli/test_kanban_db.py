@@ -1194,12 +1194,6 @@ class TestSharedBoardPaths:
 
         from gateway import session_context as sc
 
-        # A dispatcher can launch before the gateway binds its first session.
-        monkeypatch.setattr(sc, "_session_context_engaged", False)
-        sc.reset_session_vars()
-        for key in sc._VAR_MAP:
-            monkeypatch.setenv(key, "stale-routing-value")
-
         captured = {}
 
         class _FakePopen:
@@ -1210,24 +1204,30 @@ class TestSharedBoardPaths:
 
         monkeypatch.setattr("subprocess.Popen", _FakePopen)
 
-        task = kb.Task(
-            id="t_dispatch_env",
-            title="x",
-            body=None,
-            assignee="coder",
-            status="ready",
-            priority=0,
-            created_by=None,
-            created_at=0,
-            started_at=None,
-            completed_at=None,
-            workspace_kind="worktree",
-            workspace_path=str(tmp_path / "ws"),
-            claim_lock=None,
-            claim_expires=None,
-            tenant=None,
-            branch_name="wt/t_dispatch_env",
-        )
+        # Spawn refuses a task with no current run id: the restart-safe scope is
+        # keyed on the run, so an untraceable worker is never minted. Claim a
+        # real run instead of hand-building a task no dispatcher could spawn.
+        branch = "wt/t_dispatch_env"
+        kb.init_db()
+        with kbc.connect() as conn:
+            task_id = kb.create_task(
+                conn,
+                title="x",
+                assignee="coder",
+                workspace_kind="worktree",
+                workspace_path=str(tmp_path / "ws"),
+                branch_name=branch,
+            )
+            task = kb.claim_task(conn, task_id, claimer="test:dispatcher")
+        assert task is not None and task.current_run_id is not None
+
+        # A dispatcher can launch before the gateway binds its first session.
+        # Set the stale routing vars last so nothing but the spawn can see them.
+        monkeypatch.setattr(sc, "_session_context_engaged", False)
+        sc.reset_session_vars()
+        for key in sc._VAR_MAP:
+            monkeypatch.setenv(key, "stale-routing-value")
+
         kbd._default_spawn(task, str(tmp_path / "ws"))
 
         env = captured["env"]
@@ -1235,8 +1235,10 @@ class TestSharedBoardPaths:
         assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(
             default_home / "kanban" / "workspaces"
         )
-        assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
-        assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
+        assert env["HERMES_KANBAN_TASK"] == task_id
+        assert env["HERMES_KANBAN_BRANCH"] == branch
+        # The claimed run travels with the worker; the scope wrapper is keyed on it.
+        assert env["HERMES_KANBAN_RUN_ID"] == str(task.current_run_id)
         for key in sc._VAR_MAP:
             if key == "HERMES_SESSION_SOURCE":
                 # Re-set by the dispatcher, so what matters is that it carries
@@ -1814,12 +1816,19 @@ def test_default_spawn_pins_repo_root_on_module_worker_pythonpath(tmp_path, monk
 
     monkeypatch.setattr("subprocess.Popen", _FakePopen)
 
-    task = kb.Task(
-        id="t_import_root", title="x", body=None, assignee="coder", status="ready",
-        priority=0, created_by=None, created_at=0, started_at=None, completed_at=None,
-        workspace_kind="worktree", workspace_path=str(tmp_path / "ws"), claim_lock=None,
-        claim_expires=None, tenant=None, branch_name=None,
-    )
+    # Spawn refuses a task with no current run id (the restart-safe scope is keyed
+    # on the run), so claim a real one instead of hand-building a task.
+    kb.init_db()
+    with kbc.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="x",
+            assignee="coder",
+            workspace_kind="worktree",
+            workspace_path=str(tmp_path / "ws"),
+        )
+        task = kb.claim_task(conn, task_id, claimer="test:dispatcher")
+    assert task is not None and task.current_run_id is not None
 
     for resolved in ([sys.executable, "-m", "hermes_cli.main"], ["/opt/hermes/bin/hermes"]):
         monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda resolved=resolved: resolved)

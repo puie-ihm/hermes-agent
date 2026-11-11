@@ -76,6 +76,20 @@ from hermes_cli.version_info import hermes_user_agent
 _SLACK_ERROR_BODY_LIMIT_BYTES = 8 * 1024
 _BOOL_WORDS = frozenset({"1", "0", "true", "false", "yes", "no", "on", "off"})
 
+# thread_followup_mode=agent: prefixed to an unmentioned follow-up that reaches the model
+# (Jev triage fell through). The tokens are parsed by _consume_decision_sentinels.
+_FOLLOWUP_DECISION_PROMPT = (
+    "[Thread follow-up — you were NOT directly @-mentioned in this message. Decide how to respond:\n"
+    "- Reply normally ONLY if it concerns you or you can genuinely help.\n"
+    "- Output exactly [[react:emoji]] (e.g. [[react:+1]], [[react:eyes]], [[react:pray]]) to "
+    "acknowledge with a single emoji and say nothing.\n"
+    "- Output exactly [[silent]] if this is a conversation between others that does not need you.\n"
+    "If the message addresses someone else by name (even without an @mention) or continues a "
+    "side-conversation between other people, choose [[silent]] or [[react:emoji]] unless you are "
+    "clearly also being asked.\n"
+    "Pick the lightest appropriate option; do not be chatty.]"
+)
+
 # Model picker Block Kit action IDs. The picker is a two-step drill-down:
 # provider static_select → model static_select, plus Back/Cancel buttons.
 _MODEL_PICKER_PROVIDER_ACTION = "hermes_model_provider"
@@ -4320,7 +4334,12 @@ class SlackAdapter(BasePlatformAdapter):
             return True
         free_channel = self._slack_is_free_channel(channel_id)
         if not free_channel and self._slack_strict_mention() and not is_mentioned:
-            return False  # Strict mode: ignore until @-mentioned again
+            # Strict mode: ignore until @-mentioned again, except a follow-up in the bot's own
+            # thread under thread_followup_mode=agent (the fork checked that branch first).
+            return self._agent_followup_applies(
+                event=None, channel_id=channel_id, event_thread_ts=event_thread_ts,
+                team_id=team_id, is_mentioned=is_mentioned, is_thread_reply=is_thread_reply,
+                user_id=user_id, is_dm=is_dm)
         if thread_gated:
             logger.debug(
                 "[Slack] Ignoring thread reply without mention "
@@ -4360,6 +4379,8 @@ class SlackAdapter(BasePlatformAdapter):
         """
         if is_mentioned or not is_thread_reply or not event_thread_ts:
             return False
+        if is_dm and str(channel_id).startswith("D"):
+            return False  # a 1:1 DM is always addressed to the bot (the fork never triaged it)
         if self._thread_followup_mode() != "agent":
             return False
         if self._slack_is_free_channel(channel_id):
@@ -4946,6 +4967,14 @@ class SlackAdapter(BasePlatformAdapter):
             msg_event.text = (
                 f"[Slack app context: user is viewing channel {context_channel_id}]\n\n"
                 f"{msg_event.text}")
+        if not (is_command_text or force_process) and self._agent_followup_applies(
+                event=event, channel_id=channel_id, event_thread_ts=event_thread_ts,
+                team_id=team_id, is_mentioned=is_mentioned,
+                is_thread_reply=is_thread_reply, user_id=user_id, is_dm=is_dm):
+            # The agent may answer with [[silent]] / [[react:emoji]]; reply_expected=False lets
+            # that stand and keeps the turn off the live stream, where the token would show.
+            msg_event.reply_expected = False
+            msg_event.text = f"{_FOLLOWUP_DECISION_PROMPT}\n\n{msg_event.text}"
         if ts:
             self._remember_processed_message_ts(ts)
         await self.handle_message(msg_event)

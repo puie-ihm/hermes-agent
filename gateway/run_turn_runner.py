@@ -251,7 +251,10 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # no drafts, edits, native stream or commentary bubbles; the rewrite goes out as one plain
         # final while the typing indicator runs (the agent also withholds every delta).
         held = stream_held()
-        want_stream_deltas = not held and not ctx.scheduled_heartbeat and scfg.enabled_for(plat_streaming)
+        # reply_expected=False: the reply may be a silence/decision token (Slack [[silent]] /
+        # [[react:]]) that is only recognised whole, and native Slack streams cannot be retracted.
+        want_stream_deltas = (not held and not ctx.scheduled_heartbeat and ctx.reply_expected is not False
+                              and scfg.enabled_for(plat_streaming))
         # A finite (`-z`, `chat -q`) viewer prints only the terminal reply, like the classic quiet
         # CLI that never wired commentary. Commentary it cannot see must not be recorded as a
         # delivery, or a final that arrives as commentary (codex app-server) suppresses the reply.
